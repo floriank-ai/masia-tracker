@@ -129,7 +129,7 @@ def ist_bebaubar(text):
 def listing_id(lst):
     return hashlib.md5(lst["url"].encode()).hexdigest()
 
-def get(url, timeout=20):
+def get(url, timeout=8):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         r.raise_for_status()
