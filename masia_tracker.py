@@ -1,6 +1,8 @@
 """
 CASA MUSA - Masia Alert
-Fuente principal: Buscomasia (listado directo con precio, superficie, ubicacion)
+Scraping via Claude API (web_fetch) - umgeht IP-Blockaden.
+Multi-Portal: Buscomasia, Fotocasa (Via Augusta), Indomio, Milanuncios.
+Kosten: ca. 1-2$/Monat bei taeglicher Ausfuehrung.
 """
 
 import json
@@ -12,54 +14,156 @@ import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 
-# ------------------------------------------------------------------ CONFIG
 CONFIG = {
     "email_absender":   os.environ.get("EMAIL_ABSENDER",   ""),
     "email_passwort":   os.environ.get("EMAIL_PASSWORT",   ""),
     "email_empfaenger": os.environ.get("EMAIL_EMPFAENGER", ""),
+    "anthropic_key":    os.environ.get("ANTHROPIC_API_KEY", ""),
     "smtp_server":      "smtp.gmail.com",
     "smtp_port":        587,
-
-    # Masias
-    "masia_precio_max":    150_000,
-    "masia_superficie_min_ha": 5,
-    "masia_superficie_max_ha": 10,
-
-    # Terrenos (solo con ruina o casa/masia)
-    "terreno_precio_max":   60_000,
-    "terreno_superficie_min_ha": 10,
-
-    # Regiones de interes (para filtrado / score)
-    "regiones_interes": [
-        "tarragona", "priorat", "baix ebre", "terra alta",
-        "ribera d'ebre", "ribera de ebro", "montsia", "montsià",
-        "alt penedes", "alt penedès", "baix penedes", "baix penedès",
-        "alt camp", "baix camp", "conca de barbera", "conca de barberà",
-        "tarragones", "tarragonès"
-    ],
-
-    "archivo_vistos": "masia_gesehen.json",
+    "archivo_vistos":   "masia_gesehen.json",
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,ca;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
-}
+# ------------------------------------------------------------------ PORTALES
+# Seiten die Claude fuer uns abruft. Claude kann oeffentliche Seiten
+# auch scrapen wenn die Seite direkten Web-Scraper blockiert.
+
+PORTALES = [
+    {
+        "nombre": "Buscomasia",
+        "urls": [
+            "https://www.buscomasia.com/venta/provincia-tarragona/precio-asc/",
+            "https://www.buscomasia.com/priorat/",
+        ],
+    },
+    {
+        "nombre": "Fotocasa (Finques Via Augusta)",
+        "urls": [
+            "https://www.fotocasa.es/es/inmobiliaria-finques-via-augusta/comprar/inmuebles/espana/todas-las-zonas/l?clientId=9202754898213",
+        ],
+    },
+    {
+        "nombre": "Indomio (Finques Via Augusta)",
+        "urls": [
+            "https://www.indomio.es/agencias-inmobiliarias/381668/finques-via-augusta/",
+        ],
+    },
+    {
+        "nombre": "Milanuncios Tarragona",
+        "urls": [
+            "https://www.milanuncios.com/fincas-rusticas-en-tarragona/",
+        ],
+    },
+]
+
+
+PROMPT_EXTRACCION = """Analisiere das folgende HTML einer spanischen Immobilien-Webseite.
+Extrahiere ALLE Immobilien-Anzeigen (Masias, Fincas rusticas, Terrenos, Casas de campo).
+
+Ignoriere: Pisos in Staedten, Wohnungen, Garagen, Buerogebaeude.
+
+Gib als JSON zurueck, Format: {"anuncios": [...]}
+
+Fuer jede Anzeige:
+- ref: Referenznummer oder ID (String, wenn nicht vorhanden: generiere aus URL)
+- titulo: vollstaendiger Titel
+- pueblo: Ort/Gemeinde
+- comarca: Region (Baix Ebre, Priorat, Alt Camp, Baix Penedès, Ribera d'Ebre, Terra Alta, etc.)
+- precio: aktueller Preis in Euro als Ganzzahl (ohne Punkte/Kommas, z.B. 90000)
+- precio_original: falls rabattiert, sonst null
+- m2_construida: Haus-Flaeche in m2 als Zahl, null wenn nicht vorhanden
+- m2_parcela: Grundstuecks-Flaeche in m2 als Zahl, null wenn nicht vorhanden
+- url: vollstaendige URL
+- estado: "disponible" | "reservado" | "vendido" | "novedad" | "oportunidad" | "rebajado"
+- tipo: "masia" (mit Gebaeude) | "terreno" (nur Grundstueck)
+
+WICHTIG:
+- Gib NUR valides JSON zurueck, KEIN Markdown, KEINE Erklaerungen
+- Wenn keine passenden Anzeigen: {"anuncios": []}
+- Preis als Ganzzahl ohne Tausendertrennung
+"""
+
+
+# ------------------------------------------------------------------ API CALL
+
+def scrape_via_claude(url, portal_name):
+    if not CONFIG["anthropic_key"]:
+        print("  ⚠️  ANTHROPIC_API_KEY no configurada")
+        return []
+
+    headers = {
+        "x-api-key": CONFIG["anthropic_key"],
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "web-fetch-2025-09-10",
+        "content-type": "application/json",
+    }
+
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 8000,
+        "tools": [{
+            "type": "web_fetch_20250910",
+            "name": "web_fetch",
+            "max_uses": 2,
+        }],
+        "messages": [{
+            "role": "user",
+            "content": f"{PROMPT_EXTRACCION}\n\nRufe diese URL ab und extrahiere alle passenden Anzeigen: {url}"
+        }]
+    }
+
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                          headers=headers, json=body, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        print(f"  Error API: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"  Response: {e.response.text[:300]}")
+        return []
+
+    text_parts = []
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+    full_text = "\n".join(text_parts)
+
+    json_match = re.search(r'\{[\s\S]*"anuncios"[\s\S]*\}', full_text)
+    if not json_match:
+        print(f"  Kein JSON in Antwort")
+        return []
+
+    try:
+        parsed = json.loads(json_match.group(0))
+        anuncios = parsed.get("anuncios", [])
+        for a in anuncios:
+            a["fuente"] = portal_name
+        return anuncios
+    except json.JSONDecodeError as e:
+        print(f"  JSON parse error: {e}")
+        return []
+
+
+def recopilar_todos():
+    todos = {}
+    for portal in PORTALES:
+        print(f"\n  📡 {portal['nombre']}")
+        for url in portal["urls"]:
+            print(f"    {url[:70]}...")
+            anuncios = scrape_via_claude(url, portal["nombre"])
+            print(f"      -> {len(anuncios)} anuncios")
+            for a in anuncios:
+                ref = str(a.get("ref", "")).strip() or a.get("url", "")[-30:]
+                a_id = f"{portal['nombre']}_{ref}".replace(" ", "_")
+                if a_id not in todos:
+                    a["id"] = a_id
+                    todos[a_id] = a
+            time.sleep(1)
+    return list(todos.values())
 
 
 # ------------------------------------------------------------------ HELPERS
@@ -77,443 +181,249 @@ def guardar_vistos(vistos):
         json.dump(sorted(vistos), f, ensure_ascii=False, indent=2)
 
 
-def parse_numero(texto):
-    """'1.300.000 €' -> 1300000, '520.000 m2' -> 520000, '14.000' -> 14000"""
-    if not texto:
-        return None
-    # quitar todo menos digitos, punto, coma
-    limpio = re.sub(r"[^\d.,]", "", texto)
-    if not limpio:
-        return None
-    # formato europeo: . = miles, , = decimal
-    limpio = limpio.replace(".", "").replace(",", ".")
-    try:
-        return float(limpio)
-    except ValueError:
-        return None
-
-
 def m2_a_ha(m2):
     if m2 is None:
         return None
-    return round(m2 / 10_000, 2)
+    try:
+        return round(float(m2) / 10_000, 2)
+    except (ValueError, TypeError):
+        return None
 
 
-# ------------------------------------------------------------------ SCRAPING
+# ------------------------------------------------------------------ FILTER
 
-URLS_BUSCOMASIA = [
-    # Provincia y comarcas relevantes
-    "https://www.buscomasia.com/venta/provincia-tarragona/",
-    "https://www.buscomasia.com/priorat/",
-    "https://www.buscomasia.com/alt-penedes/",
-    "https://www.buscomasia.com/baix-camp/",
-    "https://www.buscomasia.com/alt-camp/",
-    "https://www.buscomasia.com/tarragona/",
+REGIONES_INTERES = [
+    "tarragona", "priorat", "baix ebre", "terra alta", "ribera d'ebre", "ribera de ebro",
+    "montsia", "montsià", "alt penedes", "alt penedès", "baix penedes", "baix penedès",
+    "alt camp", "baix camp", "conca de barbera", "conca de barberà",
+    "tarragones", "tarragonès", "perelló", "perello", "tortosa", "rasquera",
+    "ametlla", "cambrils", "reus", "falset", "montblanc", "vendrell"
 ]
 
 
-def scrape_buscomasia_listado(url):
-    """
-    Parsea el listado directamente - cada propiedad es una tarjeta con:
-    - enlace /venta/XXX-REF/
-    - titulo
-    - ubicacion "Alcover - Alt Camp"
-    - Ref. NNNN
-    - m2 construidos + m2 parcela + habitaciones + baños
-    - precio
-    """
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  Error {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    anuncios = []
-
-    # Buscar todos los enlaces a propiedades individuales
-    # Formato: /venta/slug-REFNUM/
-    enlaces_propiedades = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        m = re.search(r"/venta/([a-z0-9-]+-(\d+))/?$", href)
-        if m:
-            url_abs = urljoin("https://www.buscomasia.com", href)
-            enlaces_propiedades.add((url_abs, m.group(2)))
-
-    # Para cada propiedad, buscar su bloque de informacion en la pagina
-    # Los datos aparecen despues del ultimo enlace de galeria de cada propiedad
-    texto_completo = soup.get_text("\n", strip=True)
-
-    # Estrategia alternativa: parsear por bloques de referencia
-    # Cada tarjeta contiene "Ref. NNNN" seguido del titulo, ubicacion y datos
-    # Extraemos todos los bloques con regex sobre el texto
-
-    for url_prop, ref in enlaces_propiedades:
-        # Buscar el bloque de esta propiedad en el texto
-        # Patron: "[PRECIO] €\n\n[TITULO]\n\n[UBICACION]\n\nRef. NNNN\n\n... [m2 construida] m\n2\n...[m2 parcela] m\n2"
-        bloque_regex = rf"Ref\.\s*{ref}\b"
-        m = re.search(bloque_regex, texto_completo)
-        if not m:
-            continue
-
-        # Tomar contexto antes (titulo, ubicacion, precio) y despues (m2)
-        inicio = max(0, m.start() - 500)
-        fin = min(len(texto_completo), m.end() + 500)
-        contexto = texto_completo[inicio:fin]
-
-        # Precio: numero seguido de €, antes del titulo
-        precio = None
-        precios_encontrados = re.findall(r"([\d.,]+)\s*€", contexto[:500])
-        if precios_encontrados:
-            # Puede haber "1.300.000 €" y "1.600.000 €" (descuento) - tomar el ultimo (precio actual)
-            precio_raw = precios_encontrados[-1]
-            precio = parse_numero(precio_raw)
-
-        # Vendido?
-        vendido = "Vendido" in contexto[:500]
-
-        # Titulo: linea antes de la ubicacion
-        # Ubicacion: "Pueblo - Comarca"
-        ubicacion_match = re.search(r"([A-ZÀ-ÿ][A-Za-zÀ-ÿ' ]+)\s*-\s*([A-ZÀ-ÿ][A-Za-zÀ-ÿ' ]+)\s*\nRef\.", contexto)
-        pueblo = ubicacion_match.group(1).strip() if ubicacion_match else ""
-        comarca = ubicacion_match.group(2).strip() if ubicacion_match else ""
-
-        # Titulo: antes de la ubicacion
-        titulo = ""
-        if ubicacion_match:
-            antes = contexto[:ubicacion_match.start()].strip()
-            # ultima linea significativa
-            lineas = [l.strip() for l in antes.split("\n") if l.strip() and "€" not in l and "Vendido" not in l]
-            if lineas:
-                titulo = lineas[-1]
-
-        # m2: buscar despues de "Ref."
-        despues = contexto[m.end():]
-        # patron "NUMERO m\n2" - primero construida, luego parcela
-        m2_matches = re.findall(r"([\d.,]+)\s*m\s*\n?\s*2", despues)
-        m2_construida = parse_numero(m2_matches[0]) if len(m2_matches) >= 1 else None
-        m2_parcela    = parse_numero(m2_matches[1]) if len(m2_matches) >= 2 else None
-
-        # Habitaciones y baños
-        hab_match = re.search(r"\n(\d+(?:\s*\+\s*\d+)?)\s*\n", despues)
-
-        anuncios.append({
-            "id": f"buscomasia_{ref}",
-            "ref": ref,
-            "url": url_prop,
-            "titulo": titulo or f"Propiedad {ref}",
-            "pueblo": pueblo,
-            "comarca": comarca,
-            "precio": precio,
-            "m2_construida": m2_construida,
-            "m2_parcela": m2_parcela,
-            "ha_parcela": m2_a_ha(m2_parcela),
-            "vendido": vendido,
-            "fuente": "Buscomasia",
-        })
-
-    return anuncios
-
-
-def recopilar_todos():
-    todos = {}  # id -> anuncio (deduplicar)
-    for url in URLS_BUSCOMASIA:
-        print(f"  Scraping {url}")
-        resultados = scrape_buscomasia_listado(url)
-        print(f"    -> {len(resultados)} anuncios")
-        for a in resultados:
-            if a["id"] not in todos:
-                todos[a["id"]] = a
-        time.sleep(2)  # ser respetuoso
-    return list(todos.values())
-
-
-# ------------------------------------------------------------------ FILTRADO
-
 def clasificar(a):
-    """Devuelve 'masia', 'terreno' o None si no aplica."""
-    titulo_lower = a["titulo"].lower()
-    tiene_edificio = any(p in titulo_lower for p in [
-        "masia", "masía", "casa", "finca", "vivienda", "hotel",
-        "mas ", "ruina", "ruína", "edifici", "cortijo"
-    ])
-    es_solo_terreno = any(p in titulo_lower for p in [
-        "terreno", "parcela", "solar", "suelo"
-    ]) and not tiene_edificio
+    tipo_explicito = (a.get("tipo") or "").lower()
+    if tipo_explicito in ("masia", "terreno"):
+        return tipo_explicito
 
-    if es_solo_terreno:
+    t = (a.get("titulo") or "").lower()
+    edificio = any(p in t for p in ["masia", "masía", "casa", "finca", "vivienda",
+                                     "hotel", "mas ", "ruina", "xalet", "chalet",
+                                     "hectáreas con" , "con vivienda"])
+    solo_terreno = any(p in t for p in ["terreno", "parcela", "solar", "ackerland"]) and not edificio
+    if solo_terreno:
         return "terreno"
-    if tiene_edificio:
-        return "masia"
-    # por defecto, si esta en buscomasia y no menciona terreno -> masia
-    return "masia"
+    return "masia" if edificio else "terreno"
 
 
 def cumple_criterios(a):
-    """Filtra segun precio, superficie, region."""
-    if a["vendido"]:
-        return False, "vendido"
-    if a["precio"] is None:
-        return False, "sin precio"
+    estado = (a.get("estado") or "").lower()
+    if estado == "vendido":
+        return False
 
-    tipo = clasificar(a)
+    precio = a.get("precio")
+    if precio is None or precio <= 0:
+        return False
 
     # Region check
-    region_texto = f"{a['pueblo']} {a['comarca']}".lower()
-    region_ok = any(r in region_texto for r in CONFIG["regiones_interes"])
-    if not region_ok and a["comarca"]:  # si hay comarca pero no coincide
-        return False, f"region fuera: {a['comarca']}"
+    region_texto = f"{a.get('pueblo', '')} {a.get('comarca', '')}".lower()
+    if not any(r in region_texto for r in REGIONES_INTERES):
+        # Toleranter sein - wenn keine comarca-info vorhanden, durchlassen
+        if a.get("comarca"):
+            return False
+
+    tipo = clasificar(a)
+    m2p = a.get("m2_parcela")
+    ha = m2_a_ha(m2p) if m2p else None
 
     if tipo == "masia":
-        if a["precio"] > CONFIG["masia_precio_max"]:
-            return False, f"precio masia > {CONFIG['masia_precio_max']:,}€"
-        if a["ha_parcela"] is not None:
-            if a["ha_parcela"] < CONFIG["masia_superficie_min_ha"]:
-                return False, f"superficie masia < {CONFIG['masia_superficie_min_ha']} ha"
-            if a["ha_parcela"] > CONFIG["masia_superficie_max_ha"] * 10:
-                # permitir hasta 10x el rango (flexibilidad para fincas grandes)
-                # si quieres estricto 5-10ha, cambia a: > CONFIG['masia_superficie_max_ha']
-                pass
-        return True, "masia ok"
+        if precio > 150_000:
+            return False
+        if ha is not None and ha < 5:
+            return False
+        return True
 
     if tipo == "terreno":
-        if a["precio"] > CONFIG["terreno_precio_max"]:
-            return False, f"precio terreno > {CONFIG['terreno_precio_max']:,}€"
-        if a["ha_parcela"] is not None and a["ha_parcela"] < CONFIG["terreno_superficie_min_ha"]:
-            return False, f"superficie terreno < {CONFIG['terreno_superficie_min_ha']} ha"
-        return True, "terreno ok"
+        if precio > 60_000:
+            return False
+        if ha is not None and ha < 10:
+            return False
+        return True
 
-    return False, "sin clasificar"
+    return False
 
 
 # ------------------------------------------------------------------ EMAIL
 
-LINKS_PORTALES = [
-    ("Idealista - Tarragona fincas",
-     "https://www.idealista.com/venta-viviendas/tarragona-provincia/?tipo=finca&precioMax=150000"),
-    ("Idealista - Priorat",
-     "https://www.idealista.com/venta-viviendas/priorat-tarragona/?tipo=finca&precioMax=150000"),
-    ("Idealista - Terres de l'Ebre",
-     "https://www.idealista.com/venta-viviendas/terres-de-l-ebre-tarragona/?tipo=finca&precioMax=150000"),
-    ("Fotocasa - Casas de campo Tarragona",
-     "https://www.fotocasa.es/es/comprar/casas/tarragona-provincia/todas-las-zonas/l"),
-    ("Kyero - Fincas Tarragona",
-     "https://www.kyero.com/es/propiedad-en-venta/tarragona?precio_max=150000"),
-    ("Habitaclia - Masias Tarragona",
-     "https://www.habitaclia.com/comprar-casa_rural-tarragona_provincia.htm"),
-    ("Milanuncios - Fincas Tarragona",
-     "https://www.milanuncios.com/fincas-rusticas/tarragona.htm"),
-    ("Buscomasia - Tarragona",
-     "https://www.buscomasia.com/venta/provincia-tarragona/"),
-    ("Finques Via Augusta",
-     "https://www.finquesviaaugusta.com/es/propiedades"),
-    ("Terrenos.es - Tarragona",
-     "https://tarragona.terrenos.es/"),
-]
-
-
-def formato_precio(p):
-    if p is None:
-        return "consultar"
+def fp(p):
+    if p is None or p == 0: return "consultar"
     return f"{int(p):,} €".replace(",", ".")
 
-
-def formato_ha(ha):
-    if ha is None:
-        return "? ha"
+def fh(m2):
+    if not m2: return "? ha"
+    ha = float(m2) / 10_000
     return f"{ha:.1f} ha".replace(".", ",")
 
+def fm(m):
+    if not m: return "—"
+    return f"{int(m):,} m²".replace(",", ".")
 
-def formato_m2(m2):
-    if m2 is None:
-        return "? m²"
-    return f"{int(m2):,} m²".replace(",", ".")
+
+def badge_estado(estado):
+    if not estado: return ""
+    e = estado.lower()
+    colors = {
+        "novedad":    ("#2d8a4f", "NUEVO"),
+        "rebajado":   ("#c74b2e", "REBAJADO"),
+        "oportunidad":("#d97706", "OPORTUNIDAD"),
+        "reservado":  ("#6b7280", "RESERVADO"),
+    }
+    if e in colors:
+        bg, text = colors[e]
+        return f'<span style="background:{bg}; color:white; font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; margin-left:6px;">{text}</span>'
+    return ""
 
 
 def render_tarjeta(a):
     tipo = clasificar(a)
-    tipo_label = "🏠 MASIA" if tipo == "masia" else "🌾 TERRENO"
-    badge_color = "#8B4513" if tipo == "masia" else "#556B2F"
+    label = "🏠 MASIA" if tipo == "masia" else "🌾 TERRENO"
+    color = "#8B4513" if tipo == "masia" else "#556B2F"
+    ubi = a.get("pueblo") or ""
+    if a.get("comarca"):
+        ubi += f" · {a['comarca']}"
+    if not ubi: ubi = "Tarragona"
 
-    ubicacion = a["pueblo"]
-    if a["comarca"]:
-        ubicacion += f" · {a['comarca']}"
-    if not ubicacion:
-        ubicacion = "Tarragona"
+    precio_html = f'<div style="color:#c74b2e; font-size:20px; font-weight:700;">{fp(a.get("precio"))}</div>'
+    if a.get("precio_original") and a["precio_original"] != a.get("precio"):
+        precio_html += f'<div style="color:#999; font-size:12px; text-decoration:line-through;">{fp(a["precio_original"])}</div>'
+
+    ref = a.get("ref", "")
+    url_prop = a.get("url") or "#"
 
     return f"""
-    <tr>
-      <td style="padding:18px; border-bottom:1px solid #e5e5e5;">
-        <table width="100%" cellspacing="0" cellpadding="0">
-          <tr>
-            <td>
-              <span style="background:{badge_color}; color:white; font-size:11px; padding:3px 8px; border-radius:3px; font-weight:600; letter-spacing:0.5px;">{tipo_label}</span>
-              <span style="color:#888; font-size:11px; margin-left:8px;">Ref. {a['ref']} · {a['fuente']}</span>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding-top:10px;">
-              <a href="{a['url']}" style="color:#1a1a1a; font-size:17px; font-weight:600; text-decoration:none; line-height:1.3;">{a['titulo']}</a>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding-top:6px; color:#666; font-size:13px;">
-              📍 {ubicacion}
-            </td>
-          </tr>
-          <tr>
-            <td style="padding-top:12px;">
-              <table cellspacing="0" cellpadding="0">
-                <tr>
-                  <td style="padding-right:20px;">
-                    <div style="color:#999; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Precio</div>
-                    <div style="color:#c74b2e; font-size:20px; font-weight:700;">{formato_precio(a['precio'])}</div>
-                  </td>
-                  <td style="padding-right:20px;">
-                    <div style="color:#999; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Parcela</div>
-                    <div style="color:#1a1a1a; font-size:16px; font-weight:600;">{formato_ha(a['ha_parcela'])}</div>
-                    <div style="color:#888; font-size:11px;">{formato_m2(a['m2_parcela'])}</div>
-                  </td>
-                  <td>
-                    <div style="color:#999; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Construido</div>
-                    <div style="color:#1a1a1a; font-size:16px; font-weight:600;">{formato_m2(a['m2_construida'])}</div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding-top:14px;">
-              <a href="{a['url']}" style="background:#1a1a1a; color:white; padding:9px 18px; text-decoration:none; border-radius:4px; font-size:13px; font-weight:600; display:inline-block;">Ver propiedad →</a>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
+    <tr><td style="padding:18px 24px; border-bottom:1px solid #e5e5e5;">
+      <div style="margin-bottom:10px;">
+        <span style="background:{color}; color:white; font-size:11px; padding:3px 8px; border-radius:3px; font-weight:600; letter-spacing:0.5px;">{label}</span>
+        {badge_estado(a.get("estado"))}
+        <span style="color:#888; font-size:11px; margin-left:8px;">{a.get("fuente", "")}{" · Ref. " + str(ref) if ref else ""}</span>
+      </div>
+      <div style="margin-bottom:6px;">
+        <a href="{url_prop}" style="color:#1a1a1a; font-size:16px; font-weight:600; text-decoration:none; line-height:1.3;">{a.get('titulo', 'Sin título')}</a>
+      </div>
+      <div style="color:#666; font-size:13px; margin-bottom:12px;">📍 {ubi}</div>
+      <table cellspacing="0" cellpadding="0" style="margin-bottom:12px;">
+        <tr>
+          <td style="padding-right:24px;">
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Precio</div>
+            {precio_html}
+          </td>
+          <td style="padding-right:24px;">
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Parcela</div>
+            <div style="color:#1a1a1a; font-size:15px; font-weight:600;">{fh(a.get("m2_parcela"))}</div>
+            <div style="color:#888; font-size:11px;">{fm(a.get("m2_parcela"))}</div>
+          </td>
+          <td>
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Construido</div>
+            <div style="color:#1a1a1a; font-size:15px; font-weight:600;">{fm(a.get("m2_construida"))}</div>
+          </td>
+        </tr>
+      </table>
+      <a href="{url_prop}" style="background:#1a1a1a; color:white; padding:8px 16px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:600; display:inline-block;">Ver propiedad →</a>
+    </td></tr>
     """
 
 
-def render_botones_portales():
-    botones = ""
-    for nombre, url in LINKS_PORTALES:
-        botones += f"""
-        <a href="{url}" style="display:inline-block; background:#f5f1ea; color:#1a1a1a; padding:10px 16px; text-decoration:none; border-radius:4px; font-size:13px; margin:4px 4px 4px 0; border:1px solid #e0dcd3;">{nombre} →</a>
-        """
-    return botones
-
-
-def construir_email(anuncios_nuevos, anuncios_totales):
+def construir_email(calificados, nuevos):
     fecha = datetime.now().strftime("%d.%m.%Y")
-    n_nuevos = len(anuncios_nuevos)
+    masias = sorted([a for a in calificados if clasificar(a) == "masia"],
+                    key=lambda a: a.get("precio") or 9e9)
+    terrenos = sorted([a for a in calificados if clasificar(a) == "terreno"],
+                      key=lambda a: a.get("precio") or 9e9)
 
-    # Separar por tipo
-    masias = [a for a in anuncios_nuevos if clasificar(a) == "masia"]
-    terrenos = [a for a in anuncios_nuevos if clasificar(a) == "terreno"]
+    # Stats pro Portal
+    stats_portales = {}
+    for a in calificados:
+        f = a.get("fuente", "Unknown")
+        stats_portales[f] = stats_portales.get(f, 0) + 1
+    stats_html = " · ".join(f"{n} {k.split('(')[0].strip()}" for k, n in stats_portales.items())
 
-    # Ordenar por precio ascendente
-    masias.sort(key=lambda a: a["precio"] or 999999999)
-    terrenos.sort(key=lambda a: a["precio"] or 999999999)
-
-    bloque_masias = ""
+    bl_masias = ""
     if masias:
-        bloque_masias = f"""
-        <tr><td style="padding:20px 20px 10px; background:#f5f1ea;">
-          <h2 style="margin:0; font-size:18px; color:#1a1a1a;">🏠 Masias ({len(masias)})</h2>
-        </td></tr>
-        {''.join(render_tarjeta(a) for a in masias)}
-        """
+        header = f'<tr><td style="padding:20px 24px 10px; background:#f5f1ea;"><h2 style="margin:0; font-size:17px; color:#1a1a1a;">🏠 Masias ({len(masias)})</h2></td></tr>'
+        bl_masias = header + "".join(render_tarjeta(a) for a in masias)
 
-    bloque_terrenos = ""
+    bl_terrenos = ""
     if terrenos:
-        bloque_terrenos = f"""
-        <tr><td style="padding:20px 20px 10px; background:#f5f1ea;">
-          <h2 style="margin:0; font-size:18px; color:#1a1a1a;">🌾 Terrenos ({len(terrenos)})</h2>
-        </td></tr>
-        {''.join(render_tarjeta(a) for a in terrenos)}
-        """
+        header = f'<tr><td style="padding:20px 24px 10px; background:#f5f1ea;"><h2 style="margin:0; font-size:17px; color:#1a1a1a;">🌾 Terrenos ({len(terrenos)})</h2></td></tr>'
+        bl_terrenos = header + "".join(render_tarjeta(a) for a in terrenos)
 
-    if not masias and not terrenos:
-        bloque_sin_nuevos = """
-        <tr><td style="padding:30px; text-align:center; color:#666; background:#fafaf7;">
-          <p style="margin:0; font-size:15px;">Hoy no hay propiedades nuevas que cumplan los criterios.</p>
-          <p style="margin:8px 0 0; font-size:13px; color:#888;">Revisa los portales directamente abajo.</p>
-        </td></tr>
-        """
-    else:
-        bloque_sin_nuevos = ""
+    bl_vacio = ""
+    if not calificados:
+        bl_vacio = '<tr><td style="padding:40px 24px; text-align:center; color:#666;"><p style="margin:0; font-size:15px;">Hoy no hay propiedades que cumplan los criterios.</p></td></tr>'
 
-    html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
+    n = len(nuevos)
+    total = len(calificados)
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
 <body style="margin:0; padding:0; background:#efeae0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-  <table width="100%" cellspacing="0" cellpadding="0" style="background:#efeae0; padding:20px 0;">
-    <tr><td align="center">
-      <table width="620" cellspacing="0" cellpadding="0" style="background:white; border-radius:6px; overflow:hidden;">
+<table width="100%" cellspacing="0" cellpadding="0" style="background:#efeae0; padding:20px 0;"><tr><td align="center">
+<table width="640" cellspacing="0" cellpadding="0" style="background:white; border-radius:6px; overflow:hidden;">
 
-        <tr><td style="padding:28px 24px; background:#1a1a1a; color:white;">
-          <div style="font-size:12px; letter-spacing:2px; color:#c74b2e; font-weight:600;">CASA MUSA</div>
-          <h1 style="margin:6px 0 0; font-size:24px; font-weight:700;">Masia Alert</h1>
-          <p style="margin:8px 0 0; font-size:13px; color:#bbb;">{fecha} · {n_nuevos} {'propiedad nueva' if n_nuevos == 1 else 'propiedades nuevas'} · {anuncios_totales} en seguimiento</p>
-        </td></tr>
+  <tr><td style="padding:28px 24px; background:#1a1a1a; color:white;">
+    <div style="font-size:12px; letter-spacing:2px; color:#c74b2e; font-weight:600;">CASA MUSA</div>
+    <h1 style="margin:6px 0 0; font-size:24px; font-weight:700;">Masia Alert</h1>
+    <p style="margin:8px 0 0; font-size:13px; color:#bbb;">{fecha} · {total} propiedades · {n} {'nueva' if n == 1 else 'nuevas'}</p>
+    {f'<p style="margin:4px 0 0; font-size:11px; color:#888;">{stats_html}</p>' if stats_html else ''}
+  </td></tr>
 
-        {bloque_sin_nuevos}
-        {bloque_masias}
-        {bloque_terrenos}
+  {bl_vacio}{bl_masias}{bl_terrenos}
 
-        <tr><td style="padding:24px; background:#fafaf7; border-top:2px solid #e5e5e5;">
-          <h3 style="margin:0 0 12px; font-size:14px; color:#1a1a1a; text-transform:uppercase; letter-spacing:1px;">🔗 Buscar en portales</h3>
-          <p style="margin:0 0 14px; font-size:12px; color:#666;">Idealista, Fotocasa y Kyero bloquean scraping automatico. Haz clic para ver resultados actualizados:</p>
-          <div>{render_botones_portales()}</div>
-        </td></tr>
+  <tr><td style="padding:20px 24px; background:#fafaf7; border-top:1px solid #e5e5e5;">
+    <div style="color:#666; font-size:12px; line-height:1.6;">
+      <strong style="color:#1a1a1a;">Criterios:</strong><br>
+      🏠 Masias: 5-10 ha · max 150.000 €<br>
+      🌾 Terrenos: min 10 ha · max 60.000 €<br>
+      📍 Provincia Tarragona (Priorat, Penedès, Baix Ebre, Terra Alta, Ribera d'Ebre)
+    </div>
+  </td></tr>
 
-        <tr><td style="padding:20px 24px; background:#1a1a1a; color:#888; font-size:11px; text-align:center;">
-          Criterios: Masias 5-10ha max 150k€ · Terrenos (con ruina/casa) min 10ha max 60k€<br>
-          Regiones: Tarragona, Priorat, Penedès, Baix Ebre, Terra Alta, Ribera d'Ebre<br>
-          <span style="color:#555;">Alerta diaria 08:00</span>
-        </td></tr>
+  <tr><td style="padding:16px 24px; background:#1a1a1a; color:#888; font-size:11px; text-align:center;">
+    CASA MUSA · Alerta diaria 08:00
+  </td></tr>
 
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
-
-    return html
+</table></td></tr></table></body></html>"""
 
 
-def enviar_email(anuncios_nuevos, anuncios_totales):
+def enviar_email(calificados, nuevos):
     if not CONFIG["email_absender"] or not CONFIG["email_passwort"]:
-        print("  ⚠️  Credenciales de email no configuradas")
+        print("  ⚠️  Credenciales email no configuradas")
         return False
 
-    destinatarios = [e.strip() for e in CONFIG["email_empfaenger"].split(",") if e.strip()]
-    if not destinatarios:
-        print("  ⚠️  No hay destinatarios")
+    dest = [e.strip() for e in CONFIG["email_empfaenger"].split(",") if e.strip()]
+    if not dest:
         return False
 
     msg = MIMEMultipart("alternative")
-    n = len(anuncios_nuevos)
-    if n == 0:
-        asunto = f"CASA MUSA Masia Alert · {datetime.now().strftime('%d.%m')} · sin novedades"
+    n = len(nuevos)
+    total = len(calificados)
+    if n > 0:
+        asunto = f"CASA MUSA · {n} {'nueva' if n == 1 else 'nuevas'} · {total} total"
     else:
-        asunto = f"CASA MUSA Masia Alert · {n} {'nueva' if n == 1 else 'nuevas'}"
+        asunto = f"CASA MUSA · {total} propiedades · {datetime.now().strftime('%d.%m')}"
 
     msg["Subject"] = asunto
     msg["From"] = CONFIG["email_absender"]
-    msg["To"] = ", ".join(destinatarios)
-
-    html = construir_email(anuncios_nuevos, anuncios_totales)
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    msg["To"] = ", ".join(dest)
+    msg.attach(MIMEText(construir_email(calificados, nuevos), "html", "utf-8"))
 
     try:
         ctx = ssl.create_default_context()
         with smtplib.SMTP(CONFIG["smtp_server"], CONFIG["smtp_port"], timeout=30) as srv:
             srv.starttls(context=ctx)
             srv.login(CONFIG["email_absender"], CONFIG["email_passwort"])
-            srv.sendmail(CONFIG["email_absender"], destinatarios, msg.as_string())
-        print(f"  ✉️  Email enviado a {len(destinatarios)} destinatarios: {n} anuncios")
+            srv.sendmail(CONFIG["email_absender"], dest, msg.as_string())
+        print(f"\n  ✉️  Email a {len(dest)}: {total} total, {n} nuevas")
         return True
     except Exception as e:
         print(f"  ❌ Error email: {e}")
@@ -533,30 +443,18 @@ def ejecutar():
     todos = recopilar_todos()
     print(f"\n  Total scraped: {len(todos)}")
 
-    # Filtrar segun criterios
-    calificados = []
-    descartados = 0
-    for a in todos:
-        cumple, razon = cumple_criterios(a)
-        if cumple:
-            calificados.append(a)
-        else:
-            descartados += 1
-    print(f"  Califican: {len(calificados)} · Descartados: {descartados}")
+    calificados = [a for a in todos if cumple_criterios(a)]
+    print(f"  Califican: {len(calificados)}")
 
-    # Separar nuevos
     nuevos = [a for a in calificados if a["id"] not in vistos]
-    print(f"  Nuevos (no vistos antes): {len(nuevos)}")
+    print(f"  Nuevas: {len(nuevos)}")
 
-    # Enviar siempre
-    enviar_email(nuevos, len(calificados))
+    enviar_email(calificados, nuevos)
 
-    # Marcar como vistos (solo los nuevos que pasaron filtro)
-    for a in nuevos:
+    for a in calificados:
         vistos.add(a["id"])
     guardar_vistos(vistos)
-
-    print(f"\n  Guardados {len(vistos)} anuncios en historial")
+    print(f"  Historial: {len(vistos)}")
     print("=" * 60)
 
 
