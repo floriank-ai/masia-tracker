@@ -569,7 +569,6 @@ def email_html(listings):
 # ============================================================
 def enviar_email(listings):
     validos = filtrar(listings) if listings else []
-    # Siempre enviar - aunque no haya nuevos scrapeados, el email tiene links utiles
     html    = email_html(validos)
     n_mar   = sum(1 for l in validos if l.get("mar"))
     asunto  = (f"CASA MUSA Masia Alert — {len(validos)} nuevos"
@@ -617,8 +616,9 @@ def ejecutar():
     todos  = recopilar()
     nuevos = [(lid(l), l) for l in todos if lid(l) not in vistos]
     print(f"  Nuevos: {len(nuevos)}")
+    # Siempre enviar email con los links de portales
+    enviar_email([l for _,l in nuevos])
     if nuevos:
-        enviar_email([l for _,l in nuevos])
         guardar_vistos(vistos | {i for i,_ in nuevos})
     else:
         print("  Sin nuevos anuncios.")
