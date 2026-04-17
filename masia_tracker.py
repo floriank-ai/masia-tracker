@@ -519,14 +519,16 @@ def sende_email(neue_listings):
     betreff = (f"🏡 {len(gefiltert)} neue Masías"
                + (f" · {meerk}x Meerblick ⭐" if meerk else "")
                + f" – {datetime.now().strftime('%d.%m.%Y')}")
+    # Mehrere Empfänger: kommagetrennt im Secret
+    empfaenger_liste = [e.strip() for e in CONFIG["email_empfaenger"].split(",")]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = betreff
     msg["From"]    = CONFIG["email_absender"]
-    msg["To"]      = CONFIG["email_empfaenger"]
+    msg["To"]      = ", ".join(empfaenger_liste)
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
         srv.login(CONFIG["email_absender"], CONFIG["email_passwort"])
-        srv.sendmail(CONFIG["email_absender"], CONFIG["email_empfaenger"], msg.as_string())
+        srv.sendmail(CONFIG["email_absender"], empfaenger_liste, msg.as_string())
     print(f"  E-Mail gesendet: {len(gefiltert)} qualifizierte Angebote")
 
 # ============================================================
