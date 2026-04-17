@@ -1,8 +1,6 @@
 """
 CASA MUSA - Masia Alert
-Scraping via Claude API (web_fetch) - umgeht IP-Blockaden.
-Multi-Portal: Buscomasia, Fotocasa (Via Augusta), Indomio, Milanuncios.
-Kosten: ca. 1-2$/Monat bei taeglicher Ausfuehrung.
+Scraping via Claude API mit Rate-Limit-Handling.
 """
 
 import json
@@ -27,9 +25,9 @@ CONFIG = {
     "archivo_vistos":   "masia_gesehen.json",
 }
 
-# ------------------------------------------------------------------ PORTALES
-# Seiten die Claude fuer uns abruft. Claude kann oeffentliche Seiten
-# auch scrapen wenn die Seite direkten Web-Scraper blockiert.
+# Rate limit: 50k tokens/min. Eine Buscomasia-Seite ~25k Tokens.
+# Darum: 90s Pause zwischen Requests
+DELAY_ENTRE_REQUESTS = 75  # Sekunden
 
 PORTALES = [
     {
@@ -40,56 +38,43 @@ PORTALES = [
         ],
     },
     {
-        "nombre": "Fotocasa (Finques Via Augusta)",
-        "urls": [
-            "https://www.fotocasa.es/es/inmobiliaria-finques-via-augusta/comprar/inmuebles/espana/todas-las-zonas/l?clientId=9202754898213",
-        ],
-    },
-    {
-        "nombre": "Indomio (Finques Via Augusta)",
-        "urls": [
-            "https://www.indomio.es/agencias-inmobiliarias/381668/finques-via-augusta/",
-        ],
-    },
-    {
-        "nombre": "Milanuncios Tarragona",
+        "nombre": "Milanuncios",
         "urls": [
             "https://www.milanuncios.com/fincas-rusticas-en-tarragona/",
+        ],
+    },
+    {
+        "nombre": "Fotocasa (Via Augusta)",
+        "urls": [
+            "https://www.fotocasa.es/es/inmobiliaria-finques-via-augusta/comprar/inmuebles/espana/todas-las-zonas/l?clientId=9202754898213",
         ],
     },
 ]
 
 
-PROMPT_EXTRACCION = """Analisiere das folgende HTML einer spanischen Immobilien-Webseite.
-Extrahiere ALLE Immobilien-Anzeigen (Masias, Fincas rusticas, Terrenos, Casas de campo).
+PROMPT_EXTRACCION = """Du bekommst HTML einer spanischen Immobilien-Website.
+Extrahiere ALLE Immobilien-Anzeigen (Fincas rusticas, Masias, Terrenos, Casas de campo, Casas rurales).
 
-Ignoriere: Pisos in Staedten, Wohnungen, Garagen, Buerogebaeude.
-
-Gib als JSON zurueck, Format: {"anuncios": [...]}
+Gib als JSON zurueck: {"anuncios": [...]}
 
 Fuer jede Anzeige:
-- ref: Referenznummer oder ID (String, wenn nicht vorhanden: generiere aus URL)
-- titulo: vollstaendiger Titel
-- pueblo: Ort/Gemeinde
-- comarca: Region (Baix Ebre, Priorat, Alt Camp, Baix Penedès, Ribera d'Ebre, Terra Alta, etc.)
-- precio: aktueller Preis in Euro als Ganzzahl (ohne Punkte/Kommas, z.B. 90000)
+- ref: Referenznummer/ID (oder letzte 20 Zeichen der URL)
+- titulo: Titel der Anzeige
+- pueblo: Ort
+- comarca: Region (Baix Ebre, Priorat, Alt/Baix Penedès, Ribera d'Ebre, Terra Alta, Alt/Baix Camp, Tarragonès, Montsià)
+- precio: Preis in Euro als Ganzzahl (90000 nicht 90.000)
 - precio_original: falls rabattiert, sonst null
-- m2_construida: Haus-Flaeche in m2 als Zahl, null wenn nicht vorhanden
-- m2_parcela: Grundstuecks-Flaeche in m2 als Zahl, null wenn nicht vorhanden
+- m2_construida: Haus-Flaeche in m2 als Zahl, null wenn nicht klar
+- m2_parcela: Grundstuecks-Flaeche in m2 als Zahl (WICHTIG: parcela = terreno, nicht construida)
 - url: vollstaendige URL
 - estado: "disponible" | "reservado" | "vendido" | "novedad" | "oportunidad" | "rebajado"
-- tipo: "masia" (mit Gebaeude) | "terreno" (nur Grundstueck)
+- tipo: "masia" (mit Haus/Gebaeude) | "terreno" (nur Grundstueck/Ackerland)
 
-WICHTIG:
-- Gib NUR valides JSON zurueck, KEIN Markdown, KEINE Erklaerungen
-- Wenn keine passenden Anzeigen: {"anuncios": []}
-- Preis als Ganzzahl ohne Tausendertrennung
+WICHTIG: Nur valides JSON zurueck, kein Markdown. Wenn keine Anzeigen: {"anuncios": []}
 """
 
 
-# ------------------------------------------------------------------ API CALL
-
-def scrape_via_claude(url, portal_name):
+def scrape_via_claude(url, portal_name, retry=0):
     if not CONFIG["anthropic_key"]:
         print("  ⚠️  ANTHROPIC_API_KEY no configurada")
         return []
@@ -107,23 +92,29 @@ def scrape_via_claude(url, portal_name):
         "tools": [{
             "type": "web_fetch_20250910",
             "name": "web_fetch",
-            "max_uses": 2,
+            "max_uses": 1,  # Nur 1 Fetch pro Request -> weniger Tokens
         }],
         "messages": [{
             "role": "user",
-            "content": f"{PROMPT_EXTRACCION}\n\nRufe diese URL ab und extrahiere alle passenden Anzeigen: {url}"
+            "content": f"{PROMPT_EXTRACCION}\n\nRufe ab: {url}"
         }]
     }
 
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
                           headers=headers, json=body, timeout=180)
+
+        # Rate Limit: warten und wiederholen
+        if r.status_code == 429 and retry < 2:
+            wait_time = 65
+            print(f"      ⏳ Rate limit, warte {wait_time}s...")
+            time.sleep(wait_time)
+            return scrape_via_claude(url, portal_name, retry + 1)
+
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
-        print(f"  Error API: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"  Response: {e.response.text[:300]}")
+        print(f"      ❌ API error: {str(e)[:100]}")
         return []
 
     text_parts = []
@@ -134,7 +125,7 @@ def scrape_via_claude(url, portal_name):
 
     json_match = re.search(r'\{[\s\S]*"anuncios"[\s\S]*\}', full_text)
     if not json_match:
-        print(f"  Kein JSON in Antwort")
+        print(f"      ⚠️  Kein JSON gefunden")
         return []
 
     try:
@@ -144,25 +135,32 @@ def scrape_via_claude(url, portal_name):
             a["fuente"] = portal_name
         return anuncios
     except json.JSONDecodeError as e:
-        print(f"  JSON parse error: {e}")
+        print(f"      ⚠️  JSON error: {e}")
         return []
 
 
 def recopilar_todos():
     todos = {}
+    primer_request = True
     for portal in PORTALES:
         print(f"\n  📡 {portal['nombre']}")
         for url in portal["urls"]:
-            print(f"    {url[:70]}...")
+            # Pause zwischen Requests (ausser dem ersten)
+            if not primer_request:
+                print(f"    ⏸  Pausa {DELAY_ENTRE_REQUESTS}s (rate limit)...")
+                time.sleep(DELAY_ENTRE_REQUESTS)
+            primer_request = False
+
+            print(f"    → {url[:80]}")
             anuncios = scrape_via_claude(url, portal["nombre"])
             print(f"      -> {len(anuncios)} anuncios")
+
             for a in anuncios:
                 ref = str(a.get("ref", "")).strip() or a.get("url", "")[-30:]
                 a_id = f"{portal['nombre']}_{ref}".replace(" ", "_")
                 if a_id not in todos:
                     a["id"] = a_id
                     todos[a_id] = a
-            time.sleep(1)
     return list(todos.values())
 
 
@@ -192,45 +190,29 @@ def m2_a_ha(m2):
 
 # ------------------------------------------------------------------ FILTER
 
-REGIONES_INTERES = [
-    "tarragona", "priorat", "baix ebre", "terra alta", "ribera d'ebre", "ribera de ebro",
-    "montsia", "montsià", "alt penedes", "alt penedès", "baix penedes", "baix penedès",
-    "alt camp", "baix camp", "conca de barbera", "conca de barberà",
-    "tarragones", "tarragonès", "perelló", "perello", "tortosa", "rasquera",
-    "ametlla", "cambrils", "reus", "falset", "montblanc", "vendrell"
-]
-
-
 def clasificar(a):
-    tipo_explicito = (a.get("tipo") or "").lower()
+    tipo_explicito = (a.get("tipo") or "").lower().strip()
     if tipo_explicito in ("masia", "terreno"):
         return tipo_explicito
 
     t = (a.get("titulo") or "").lower()
     edificio = any(p in t for p in ["masia", "masía", "casa", "finca", "vivienda",
                                      "hotel", "mas ", "ruina", "xalet", "chalet",
-                                     "hectáreas con" , "con vivienda"])
-    solo_terreno = any(p in t for p in ["terreno", "parcela", "solar", "ackerland"]) and not edificio
-    if solo_terreno:
-        return "terreno"
-    return "masia" if edificio else "terreno"
+                                     "con vivienda", "con casa"])
+    if edificio:
+        return "masia"
+    return "terreno"
 
 
 def cumple_criterios(a):
-    estado = (a.get("estado") or "").lower()
+    """Gibt (bool, reason) zurueck fuer Debug"""
+    estado = (a.get("estado") or "").lower().strip()
     if estado == "vendido":
-        return False
+        return False, f"vendido"
 
     precio = a.get("precio")
     if precio is None or precio <= 0:
-        return False
-
-    # Region check
-    region_texto = f"{a.get('pueblo', '')} {a.get('comarca', '')}".lower()
-    if not any(r in region_texto for r in REGIONES_INTERES):
-        # Toleranter sein - wenn keine comarca-info vorhanden, durchlassen
-        if a.get("comarca"):
-            return False
+        return False, "sin precio"
 
     tipo = clasificar(a)
     m2p = a.get("m2_parcela")
@@ -238,19 +220,20 @@ def cumple_criterios(a):
 
     if tipo == "masia":
         if precio > 150_000:
-            return False
+            return False, f"masia precio {precio}€ > 150.000€"
+        # Flaeche optional: wenn nicht vorhanden, durchlassen
         if ha is not None and ha < 5:
-            return False
-        return True
+            return False, f"masia {ha}ha < 5ha"
+        return True, f"masia ok ({precio}€, {ha}ha)"
 
     if tipo == "terreno":
         if precio > 60_000:
-            return False
+            return False, f"terreno precio {precio}€ > 60.000€"
         if ha is not None and ha < 10:
-            return False
-        return True
+            return False, f"terreno {ha}ha < 10ha"
+        return True, f"terreno ok ({precio}€, {ha}ha)"
 
-    return False
+    return False, "sin clasificar"
 
 
 # ------------------------------------------------------------------ EMAIL
@@ -333,19 +316,12 @@ def render_tarjeta(a):
     """
 
 
-def construir_email(calificados, nuevos):
+def construir_email(calificados, nuevos, total_scraped, descartados_info):
     fecha = datetime.now().strftime("%d.%m.%Y")
     masias = sorted([a for a in calificados if clasificar(a) == "masia"],
                     key=lambda a: a.get("precio") or 9e9)
     terrenos = sorted([a for a in calificados if clasificar(a) == "terreno"],
                       key=lambda a: a.get("precio") or 9e9)
-
-    # Stats pro Portal
-    stats_portales = {}
-    for a in calificados:
-        f = a.get("fuente", "Unknown")
-        stats_portales[f] = stats_portales.get(f, 0) + 1
-    stats_html = " · ".join(f"{n} {k.split('(')[0].strip()}" for k, n in stats_portales.items())
 
     bl_masias = ""
     if masias:
@@ -359,7 +335,10 @@ def construir_email(calificados, nuevos):
 
     bl_vacio = ""
     if not calificados:
-        bl_vacio = '<tr><td style="padding:40px 24px; text-align:center; color:#666;"><p style="margin:0; font-size:15px;">Hoy no hay propiedades que cumplan los criterios.</p></td></tr>'
+        bl_vacio = f'''<tr><td style="padding:40px 24px; text-align:center; color:#666;">
+          <p style="margin:0 0 8px; font-size:15px;">Hoy no hay propiedades que cumplan los criterios.</p>
+          <p style="margin:0; font-size:13px; color:#999;">{total_scraped} scraped · 0 califican</p>
+        </td></tr>'''
 
     n = len(nuevos)
     total = len(calificados)
@@ -374,7 +353,6 @@ def construir_email(calificados, nuevos):
     <div style="font-size:12px; letter-spacing:2px; color:#c74b2e; font-weight:600;">CASA MUSA</div>
     <h1 style="margin:6px 0 0; font-size:24px; font-weight:700;">Masia Alert</h1>
     <p style="margin:8px 0 0; font-size:13px; color:#bbb;">{fecha} · {total} propiedades · {n} {'nueva' if n == 1 else 'nuevas'}</p>
-    {f'<p style="margin:4px 0 0; font-size:11px; color:#888;">{stats_html}</p>' if stats_html else ''}
   </td></tr>
 
   {bl_vacio}{bl_masias}{bl_terrenos}
@@ -382,9 +360,9 @@ def construir_email(calificados, nuevos):
   <tr><td style="padding:20px 24px; background:#fafaf7; border-top:1px solid #e5e5e5;">
     <div style="color:#666; font-size:12px; line-height:1.6;">
       <strong style="color:#1a1a1a;">Criterios:</strong><br>
-      🏠 Masias: 5-10 ha · max 150.000 €<br>
-      🌾 Terrenos: min 10 ha · max 60.000 €<br>
-      📍 Provincia Tarragona (Priorat, Penedès, Baix Ebre, Terra Alta, Ribera d'Ebre)
+      🏠 Masias: max 150.000 € · min 5 ha (flexibel wenn unbekannt)<br>
+      🌾 Terrenos: max 60.000 € · min 10 ha<br>
+      📍 Provincia Tarragona
     </div>
   </td></tr>
 
@@ -395,7 +373,7 @@ def construir_email(calificados, nuevos):
 </table></td></tr></table></body></html>"""
 
 
-def enviar_email(calificados, nuevos):
+def enviar_email(calificados, nuevos, total_scraped, descartados_info):
     if not CONFIG["email_absender"] or not CONFIG["email_passwort"]:
         print("  ⚠️  Credenciales email no configuradas")
         return False
@@ -415,7 +393,7 @@ def enviar_email(calificados, nuevos):
     msg["Subject"] = asunto
     msg["From"] = CONFIG["email_absender"]
     msg["To"] = ", ".join(dest)
-    msg.attach(MIMEText(construir_email(calificados, nuevos), "html", "utf-8"))
+    msg.attach(MIMEText(construir_email(calificados, nuevos, total_scraped, descartados_info), "html", "utf-8"))
 
     try:
         ctx = ssl.create_default_context()
@@ -443,13 +421,39 @@ def ejecutar():
     todos = recopilar_todos()
     print(f"\n  Total scraped: {len(todos)}")
 
-    calificados = [a for a in todos if cumple_criterios(a)]
+    # DEBUG: warum werden Angebote aussortiert?
+    calificados = []
+    descartados = []
+    for a in todos:
+        cumple, razon = cumple_criterios(a)
+        if cumple:
+            calificados.append(a)
+        else:
+            descartados.append((a, razon))
+
     print(f"  Califican: {len(calificados)}")
+    print(f"  Descartados: {len(descartados)}")
+
+    # Zeige Beispiele der Descartados zum Debuggen
+    print(f"\n  📋 Beispiele Descartados (zeige erste 10):")
+    for a, razon in descartados[:10]:
+        titulo = (a.get("titulo") or "")[:50]
+        ubi = a.get("pueblo", "") + " " + (a.get("comarca") or "")
+        print(f"    · {titulo:50} | {ubi[:30]:30} | {razon}")
+
+    # Zeige Beispiele der Calificados
+    if calificados:
+        print(f"\n  ✅ Calificados:")
+        for a in calificados[:10]:
+            titulo = (a.get("titulo") or "")[:50]
+            precio = a.get("precio", 0)
+            ha = m2_a_ha(a.get("m2_parcela"))
+            print(f"    · {titulo:50} | {precio}€ | {ha}ha")
 
     nuevos = [a for a in calificados if a["id"] not in vistos]
-    print(f"  Nuevas: {len(nuevos)}")
+    print(f"\n  Nuevas: {len(nuevos)}")
 
-    enviar_email(calificados, nuevos)
+    enviar_email(calificados, nuevos, len(todos), descartados[:10])
 
     for a in calificados:
         vistos.add(a["id"])
