@@ -25,8 +25,10 @@ CONFIG = {
     "terreno_ha_min":     10,
 
     "regiones_buscomasia": [
-        "tarragona", "priorat", "baix-ebre", "alt-penedes", "baix-camp",
-        "terra-alta", "conca-de-barbera",
+        "venta/provincia-tarragona",
+        "priorat",
+        "alt-penedes",
+        "baix-camp",
     ],
     "palabras_edificio": [
         "masia", "masoveria", "casa", "cabana", "ruina", "ruines",
@@ -150,56 +152,64 @@ def listing(fuente, titulo, precio_t, sup_t, region, url, txt, tipo):
 # ============================================================
 
 def scrape_buscomasia():
-    """Visita cada anuncio individualmente para extraer datos reales"""
     res = []
     urls_anuncios = set()
 
-    # Recopilar URLs de anuncios de todas las regiones
-    for reg in CONFIG["regiones_buscomasia"]:
-        soup = get(f"https://www.buscomasia.com/{reg}/")
+    paginas = [
+        "https://www.buscomasia.com/tarragona/",
+        "https://www.buscomasia.com/priorat/",
+        "https://www.buscomasia.com/alt-penedes/",
+        "https://www.buscomasia.com/baix-camp/",
+        "https://www.buscomasia.com/venta/provincia-tarragona/",
+    ]
+
+    for pag in paginas:
+        soup = get(pag)
         if not soup: continue
-        for a in soup.select("a[href*='/venta/']"):
-            href = a.get("href","")
+        # Links zu einzelnen Angeboten
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
             if not href.startswith("http"):
                 href = "https://www.buscomasia.com" + href
-            if "/venta/" in href and href not in urls_anuncios:
+            if "/venta/" in href and href.count("/") >= 4:
                 urls_anuncios.add(href)
-        time.sleep(1)
+        time.sleep(1.5)
 
-    print(f"  Buscomasia: {len(urls_anuncios)} URLs encontradas, visitando detalles...")
+    print(f"  Buscomasia: {len(urls_anuncios)} URLs encontradas")
 
-    for url in list(urls_anuncios)[:60]:  # max 60 para no tardar demasiado
+    for url in list(urls_anuncios)[:50]:
         soup = get(url)
         if not soup: continue
-
         txt = soup.get_text(" ", strip=True)
 
-        # Titulo: h1
+        # Titulo
         h1 = soup.select_one("h1")
-        titulo = h1.get_text(strip=True) if h1 else ""
+        titulo = h1.get_text(strip=True) if h1 else url.split("/")[-2].replace("-"," ").title()
 
-        # Precio: buscar patron "90.000 €" en el texto
-        precio_match = re.search(r"([\d\.]+\.[\d]{3})\s*€", txt)
-        if not precio_match:
-            precio_match = re.search(r"(\d+\.?\d*)\s*€", txt)
-        precio_t = precio_match.group(0) if precio_match else ""
+        # Precio — patron "90.000 EUR" o direkt im Text
+        precio_t = ""
+        for pat in [r"[0-9]{1,3}(?:\.[0-9]{3})+\s*[EUR€]", r"[0-9]+\.?[0-9]*\s*[EUR€]"]:
+            m = re.search(pat, txt)
+            if m:
+                precio_t = m.group(0)
+                break
 
-        # Superficie: buscar "443.500 m2" o "44,35 ha" o "44,35 hectareas"
-        sup_match = re.search(r"([\d\.,]+)\s*(hectar[eá]as?|ha\b)", txt.lower())
-        if not sup_match:
-            sup_match = re.search(r"([\d\.]+)\s*m2", txt)
-        sup_t = sup_match.group(0) if sup_match else ""
+        # Superficie — ha oder m2
+        sup_t = ""
+        for pat in [r"[0-9][0-9.,]*\s*(?:hectareas?|ha)", r"[0-9]{3,}(?:\.[0-9]{3})*\s*m2"]:
+            m = re.search(pat, txt.lower())
+            if m:
+                sup_t = m.group(0)
+                break
 
-        # Region: intentar extraer de la URL o del texto
+        # Region
         region = "Tarragona"
-        for reg in CONFIG["regiones_buscomasia"]:
+        for reg in ["priorat","alt-penedes","baix-camp","penedes"]:
             if reg in url.lower():
                 region = reg.replace("-"," ").title()
                 break
 
-        # Tipo: si no tiene edificio mencionado = terreno, sino masia
         tipo = "masia" if tiene_edificio(titulo+" "+txt) else "terreno"
-
         res.append(listing("Buscomasia", titulo, precio_t, sup_t, region, url, txt, tipo))
         time.sleep(0.8)
 
@@ -558,10 +568,8 @@ def email_html(listings):
 #  ENVIO
 # ============================================================
 def enviar_email(listings):
-    validos = filtrar(listings)
-    if not validos:
-        print("  Sin resultados validos.")
-        return
+    validos = filtrar(listings) if listings else []
+    # Siempre enviar - aunque no haya nuevos scrapeados, el email tiene links utiles
     html    = email_html(validos)
     n_mar   = sum(1 for l in validos if l.get("mar"))
     asunto  = (f"CASA MUSA Masia Alert — {len(validos)} nuevos"
