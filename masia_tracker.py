@@ -1,7 +1,6 @@
 """
 CASA MUSA - Masia Alert
-Scraping via Claude API mit realistischen Filtern.
-3 Kategorien: Masias, Terrenos, Bonus (nah dran aber interessant).
+Scraping via Claude API. Sauberes professionelles Design.
 """
 
 import json
@@ -43,7 +42,7 @@ PORTALES = [
         ],
     },
     {
-        "nombre": "Fotocasa (Via Augusta)",
+        "nombre": "Fotocasa",
         "urls": [
             "https://www.fotocasa.es/es/inmobiliaria-finques-via-augusta/comprar/inmuebles/espana/todas-las-zonas/l?clientId=9202754898213",
         ],
@@ -53,7 +52,7 @@ PORTALES = [
 
 PROMPT_EXTRACCION = """Du bekommst eine spanische Immobilien-Webseite. Extrahiere ABSOLUT JEDE EINZELNE Immobilien-Anzeige.
 
-KRITISCH: Extrahiere JEDE Anzeige, auch wenn es 30, 50 oder 100 sind. NICHT nur 2-3!
+KRITISCH: Extrahiere JEDE Anzeige, auch 30-100 Stueck. NICHT nur 2-3!
 
 Gib JSON zurueck: {"anuncios": [{"ref": "...", "titulo": "...", "pueblo": "...", "comarca": "...", "precio": 90000, "precio_original": null, "m2_construida": null, "m2_parcela": 55000, "url": "https://...", "estado": "disponible", "tipo": "masia"}]}
 
@@ -61,22 +60,21 @@ Felder:
 - ref: Referenznummer/ID
 - titulo: Titel
 - pueblo: Ortschaft
-- comarca: Region (Baix Ebre, Priorat, Alt/Baix Camp, Alt/Baix Penedès, Ribera d'Ebre, Terra Alta, Tarragonès, Montsià)
-- precio: aktueller Preis in Euro als Zahl (90000 nicht "90.000 €")
-- precio_original: Originalpreis bei Rabatt, sonst null
-- m2_construida: Haus-m² als Zahl, null wenn keine Info
-- m2_parcela: Grundstueck-m² als Zahl (parcela/terreno/plot)
+- comarca: Region
+- precio: Euro als Zahl (90000, nicht "90.000 €")
+- precio_original: bei Rabatt, sonst null
+- m2_construida: Haus-m² (null wenn unbekannt)
+- m2_parcela: Grundstueck-m² (parcela/terreno)
 - url: volle URL
-- estado: disponible | reservado | vendido | novedad | oportunidad | rebajado
-- tipo: masia (mit Haus/Gebaeude/Casa) | terreno (nur Grundstueck)
+- estado: disponible|reservado|vendido|novedad|oportunidad|rebajado
+- tipo: masia (mit Haus) | terreno (nur Grundstueck)
 
-NUR JSON, kein Markdown, keine ``` Marker.
+NUR JSON, kein Markdown.
 """
 
 
 def scrape_via_claude(url, portal_name, retry=0):
     if not CONFIG["anthropic_key"]:
-        print("  ⚠️  ANTHROPIC_API_KEY no configurada")
         return []
 
     headers = {
@@ -85,46 +83,31 @@ def scrape_via_claude(url, portal_name, retry=0):
         "anthropic-beta": "web-fetch-2025-09-10",
         "content-type": "application/json",
     }
-
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 16000,
-        "tools": [{
-            "type": "web_fetch_20250910",
-            "name": "web_fetch",
-            "max_uses": 1,
-        }],
-        "messages": [{
-            "role": "user",
-            "content": f"{PROMPT_EXTRACCION}\n\nRufe ab und extrahiere ALLE Anzeigen: {url}"
-        }]
+        "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 1}],
+        "messages": [{"role": "user", "content": f"{PROMPT_EXTRACCION}\n\nRufe ab und extrahiere ALLE Anzeigen: {url}"}]
     }
 
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-                          headers=headers, json=body, timeout=240)
+        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=240)
         if r.status_code == 429 and retry < 3:
-            print(f"      ⏳ Rate limit, warte 70s... (retry {retry+1}/3)")
+            print(f"      Rate limit, warte 70s... (retry {retry+1}/3)")
             time.sleep(70)
             return scrape_via_claude(url, portal_name, retry + 1)
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
-        print(f"      ❌ API error: {str(e)[:150]}")
+        print(f"      API error: {str(e)[:150]}")
         return []
 
-    text_parts = []
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            text_parts.append(block.get("text", ""))
-    full_text = "\n".join(text_parts)
-
-    full_text = re.sub(r'```(?:json)?\s*', '', full_text)
+    text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+    full_text = re.sub(r'```(?:json)?\s*', '', "\n".join(text_parts))
     full_text = re.sub(r'```', '', full_text)
 
     json_match = re.search(r'\{[\s\S]*"anuncios"[\s\S]*\}', full_text)
     if not json_match:
-        print(f"      ⚠️  Kein JSON")
         return []
 
     try:
@@ -141,15 +124,15 @@ def recopilar_todos():
     todos = {}
     primer = True
     for portal in PORTALES:
-        print(f"\n  📡 {portal['nombre']}")
+        print(f"\n  {portal['nombre']}")
         for url in portal["urls"]:
             if not primer:
-                print(f"    ⏸  Pausa {DELAY_ENTRE_REQUESTS}s...")
+                print(f"    Pausa {DELAY_ENTRE_REQUESTS}s...")
                 time.sleep(DELAY_ENTRE_REQUESTS)
             primer = False
-            print(f"    → {url[:80]}")
+            print(f"    -> {url[:80]}")
             anuncios = scrape_via_claude(url, portal["nombre"])
-            print(f"      -> {len(anuncios)} anuncios")
+            print(f"       {len(anuncios)} anuncios")
             for a in anuncios:
                 ref = str(a.get("ref", "")).strip() or a.get("url", "")[-30:]
                 a_id = f"{portal['nombre']}_{ref}".replace(" ", "_")
@@ -191,21 +174,7 @@ def clasificar(a):
     return "terreno"
 
 
-# ============ NEUE KATEGORISIERUNG: perfect / bonus / nein ============
-
 def categorizar(a):
-    """
-    Returns: ('perfecto', reason) | ('bonus', reason) | ('descartado', reason)
-
-    PERFEKT = erfuellt alle Kriterien strict:
-      - Masia: max 150k€, min 5ha
-      - Terreno: max 60k€, min 10ha
-
-    BONUS = "nah dran" oder besonders interessant:
-      - Masia: max 200k€ ODER min 2ha
-      - Terreno: grosse Flaeche (20ha+) auch wenn teurer
-      - Oder: guter Preis/Flaeche Ratio
-    """
     estado = (a.get("estado") or "").lower().strip()
     if estado == "vendido":
         return "descartado", "vendido"
@@ -219,30 +188,24 @@ def categorizar(a):
     ha = m2_a_ha(m2p) if m2p else None
 
     if tipo == "masia":
-        # PERFEKT
         if precio <= 150_000 and (ha is None or ha >= 5):
             return "perfecto", f"masia {precio}€ {ha}ha"
-        # BONUS - nah dran
         if precio <= 200_000 and (ha is None or ha >= 2):
             return "bonus", f"masia {precio}€ {ha}ha (cerca)"
-        # Ausgeschlossen
         if precio > 200_000:
-            return "descartado", f"muy caro {precio}€"
-        return "descartado", f"poca superficie {ha}ha"
+            return "descartado", f"caro {precio}€"
+        return "descartado", f"poca sup. {ha}ha"
 
     if tipo == "terreno":
-        # PERFEKT
         if precio <= 60_000 and (ha is None or ha >= 10):
             return "perfecto", f"terreno {precio}€ {ha}ha"
-        # BONUS - sehr viel Flaeche oder bezahlbar-groß
         if ha is not None and ha >= 20 and precio <= 150_000:
             return "bonus", f"terreno grande {ha}ha"
         if precio <= 90_000 and (ha is None or ha >= 5):
             return "bonus", f"terreno {precio}€ {ha}ha (cerca)"
-        # Ausgeschlossen
         if precio > 150_000:
-            return "descartado", f"muy caro {precio}€"
-        return "descartado", f"poca superficie"
+            return "descartado", f"caro {precio}€"
+        return "descartado", f"poca sup."
 
     return "descartado", "?"
 
@@ -254,7 +217,7 @@ def fp(p):
     return f"{int(p):,} €".replace(",", ".")
 
 def fh(m2):
-    if not m2: return "? ha"
+    if not m2: return "—"
     ha = float(m2) / 10_000
     return f"{ha:.1f} ha".replace(".", ",")
 
@@ -274,68 +237,67 @@ def badge_estado(estado):
     }
     if e in colors:
         bg, text = colors[e]
-        return f'<span style="background:{bg}; color:white; font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; margin-left:6px;">{text}</span>'
+        return f'<span style="background:{bg}; color:white; font-size:10px; padding:3px 7px; border-radius:2px; font-weight:600; letter-spacing:0.5px; margin-left:8px;">{text}</span>'
     return ""
 
 
 def render_tarjeta(a, es_bonus=False):
     tipo = clasificar(a)
-    label = "🏠 MASIA" if tipo == "masia" else "🌾 TERRENO"
+    label = "MASIA" if tipo == "masia" else "TERRENO"
     color = "#8B4513" if tipo == "masia" else "#556B2F"
 
-    # Bonus-Markierung
-    bonus_badge = ""
+    cerca_badge = ""
     if es_bonus:
-        bonus_badge = '<span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; margin-left:6px;">CERCA</span>'
+        cerca_badge = '<span style="background:#d97706; color:white; font-size:10px; padding:3px 7px; border-radius:2px; font-weight:600; letter-spacing:0.5px; margin-left:8px;">CERCA</span>'
 
     ubi = a.get("pueblo") or ""
     if a.get("comarca"):
         ubi += f" · {a['comarca']}"
     if not ubi: ubi = "Tarragona"
 
-    precio_html = f'<div style="color:#c74b2e; font-size:20px; font-weight:700;">{fp(a.get("precio"))}</div>'
+    precio_html = f'<div style="color:#1a1a1a; font-size:22px; font-weight:700; line-height:1;">{fp(a.get("precio"))}</div>'
     if a.get("precio_original") and a["precio_original"] != a.get("precio"):
-        precio_html += f'<div style="color:#999; font-size:12px; text-decoration:line-through;">{fp(a["precio_original"])}</div>'
+        precio_html += f'<div style="color:#999; font-size:12px; text-decoration:line-through; margin-top:2px;">{fp(a["precio_original"])}</div>'
 
     ref = a.get("ref", "")
     url_prop = a.get("url") or "#"
 
     return f"""
-    <tr><td style="padding:18px 24px; border-bottom:1px solid #e5e5e5;">
-      <div style="margin-bottom:10px;">
-        <span style="background:{color}; color:white; font-size:11px; padding:3px 8px; border-radius:3px; font-weight:600; letter-spacing:0.5px;">{label}</span>
-        {bonus_badge}
+    <tr><td style="padding:20px 24px; border-bottom:1px solid #eeeae2;">
+      <div style="margin-bottom:12px;">
+        <span style="background:{color}; color:white; font-size:10px; padding:3px 8px; border-radius:2px; font-weight:600; letter-spacing:1px;">{label}</span>
+        {cerca_badge}
         {badge_estado(a.get("estado"))}
-        <span style="color:#888; font-size:11px; margin-left:8px;">{a.get("fuente", "")}{" · Ref. " + str(ref) if ref else ""}</span>
+        <span style="color:#999; font-size:11px; margin-left:10px;">{a.get("fuente", "")}{" · " + str(ref) if ref else ""}</span>
       </div>
       <div style="margin-bottom:6px;">
-        <a href="{url_prop}" style="color:#1a1a1a; font-size:16px; font-weight:600; text-decoration:none; line-height:1.3;">{a.get('titulo', 'Sin título')}</a>
+        <a href="{url_prop}" style="color:#1a1a1a; font-size:17px; font-weight:600; text-decoration:none; line-height:1.3;">{a.get('titulo', 'Sin título')}</a>
       </div>
-      <div style="color:#666; font-size:13px; margin-bottom:12px;">📍 {ubi}</div>
-      <table cellspacing="0" cellpadding="0" style="margin-bottom:12px;">
+      <div style="color:#666; font-size:13px; margin-bottom:16px;">{ubi}</div>
+      <table cellspacing="0" cellpadding="0" style="margin-bottom:14px;">
         <tr>
-          <td style="padding-right:24px;">
-            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Precio</div>
+          <td style="padding-right:28px;">
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Precio</div>
             {precio_html}
           </td>
-          <td style="padding-right:24px;">
-            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Parcela</div>
-            <div style="color:#1a1a1a; font-size:15px; font-weight:600;">{fh(a.get("m2_parcela"))}</div>
+          <td style="padding-right:28px;">
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Parcela</div>
+            <div style="color:#1a1a1a; font-size:16px; font-weight:600;">{fh(a.get("m2_parcela"))}</div>
             <div style="color:#888; font-size:11px;">{fm(a.get("m2_parcela"))}</div>
           </td>
           <td>
-            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:0.5px;">Construido</div>
-            <div style="color:#1a1a1a; font-size:15px; font-weight:600;">{fm(a.get("m2_construida"))}</div>
+            <div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Construido</div>
+            <div style="color:#1a1a1a; font-size:16px; font-weight:600;">{fm(a.get("m2_construida"))}</div>
           </td>
         </tr>
       </table>
-      <a href="{url_prop}" style="background:#1a1a1a; color:white; padding:8px 16px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:600; display:inline-block;">Ver propiedad →</a>
+      <a href="{url_prop}" style="background:#1a1a1a; color:white; padding:9px 18px; text-decoration:none; border-radius:2px; font-size:12px; font-weight:600; display:inline-block; letter-spacing:0.5px;">Ver propiedad</a>
     </td></tr>
     """
 
 
 def construir_email(perfectos, bonus, total_scraped):
-    fecha = datetime.now().strftime("%d.%m.%Y")
+    fecha = datetime.now().strftime("%d de %B de %Y").replace("January","enero").replace("February","febrero").replace("March","marzo").replace("April","abril").replace("May","mayo").replace("June","junio").replace("July","julio").replace("August","agosto").replace("September","septiembre").replace("October","octubre").replace("November","noviembre").replace("December","diciembre")
 
     p_masias   = sorted([a for a in perfectos if clasificar(a) == "masia"],   key=lambda a: a.get("precio") or 9e9)
     p_terrenos = sorted([a for a in perfectos if clasificar(a) == "terreno"], key=lambda a: a.get("precio") or 9e9)
@@ -345,55 +307,61 @@ def construir_email(perfectos, bonus, total_scraped):
     bloques = ""
 
     if p_masias or p_terrenos:
-        bloques += '<tr><td style="padding:20px 24px 6px; background:#1a1a1a; color:white;"><h2 style="margin:0; font-size:15px; letter-spacing:1px; text-transform:uppercase;">⭐ Cumplen todos los criterios</h2></td></tr>'
+        bloques += '<tr><td style="padding:24px 24px 6px; background:white; border-bottom:1px solid #eeeae2;"><div style="color:#999; font-size:10px; text-transform:uppercase; letter-spacing:2px; font-weight:600;">Cumplen criterios</div><h2 style="margin:4px 0 0; font-size:20px; color:#1a1a1a; font-weight:700;">Seleccion principal</h2></td></tr>'
         if p_masias:
-            bloques += f'<tr><td style="padding:16px 24px 8px; background:#f5f1ea;"><h3 style="margin:0; font-size:15px; color:#1a1a1a;">🏠 Masias ({len(p_masias)})</h3></td></tr>'
+            bloques += f'<tr><td style="padding:16px 24px 8px; background:#f8f5ef;"><div style="color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">Masias · {len(p_masias)}</div></td></tr>'
             bloques += "".join(render_tarjeta(a) for a in p_masias)
         if p_terrenos:
-            bloques += f'<tr><td style="padding:16px 24px 8px; background:#f5f1ea;"><h3 style="margin:0; font-size:15px; color:#1a1a1a;">🌾 Terrenos ({len(p_terrenos)})</h3></td></tr>'
+            bloques += f'<tr><td style="padding:16px 24px 8px; background:#f8f5ef;"><div style="color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">Terrenos · {len(p_terrenos)}</div></td></tr>'
             bloques += "".join(render_tarjeta(a) for a in p_terrenos)
 
     if b_masias or b_terrenos:
-        bloques += '<tr><td style="padding:20px 24px 6px; background:#fff7ed; border-top:2px solid #f59e0b;"><h2 style="margin:0; font-size:15px; letter-spacing:1px; text-transform:uppercase; color:#92400e;">🔥 Cerca de los criterios</h2><p style="margin:4px 0 0; font-size:12px; color:#78350f;">Propiedades interesantes aunque no cumplen 100%</p></td></tr>'
+        bloques += '<tr><td style="padding:24px 24px 6px; background:white; border-top:1px solid #eeeae2; border-bottom:1px solid #eeeae2;"><div style="color:#d97706; font-size:10px; text-transform:uppercase; letter-spacing:2px; font-weight:600;">Cerca de los criterios</div><h2 style="margin:4px 0 0; font-size:20px; color:#1a1a1a; font-weight:700;">Tambien interesantes</h2></td></tr>'
         if b_masias:
-            bloques += f'<tr><td style="padding:16px 24px 8px; background:#fffbeb;"><h3 style="margin:0; font-size:15px; color:#1a1a1a;">🏠 Masias ({len(b_masias)})</h3></td></tr>'
+            bloques += f'<tr><td style="padding:16px 24px 8px; background:#fdfaf3;"><div style="color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">Masias · {len(b_masias)}</div></td></tr>'
             bloques += "".join(render_tarjeta(a, es_bonus=True) for a in b_masias)
         if b_terrenos:
-            bloques += f'<tr><td style="padding:16px 24px 8px; background:#fffbeb;"><h3 style="margin:0; font-size:15px; color:#1a1a1a;">🌾 Terrenos ({len(b_terrenos)})</h3></td></tr>'
+            bloques += f'<tr><td style="padding:16px 24px 8px; background:#fdfaf3;"><div style="color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">Terrenos · {len(b_terrenos)}</div></td></tr>'
             bloques += "".join(render_tarjeta(a, es_bonus=True) for a in b_terrenos)
 
     if not perfectos and not bonus:
-        bloques = f'<tr><td style="padding:40px 24px; text-align:center; color:#666;"><p style="margin:0 0 8px; font-size:15px;">Hoy no hay propiedades que cumplan los criterios.</p><p style="margin:0; font-size:13px; color:#999;">{total_scraped} scraped · 0 califican</p></td></tr>'
+        bloques = f'<tr><td style="padding:60px 24px; text-align:center; background:white;"><p style="margin:0 0 8px; font-size:15px; color:#1a1a1a;">Hoy no hay propiedades que cumplan los criterios.</p><p style="margin:0; font-size:13px; color:#999;">{total_scraped} propiedades analizadas.</p></td></tr>'
 
-    total = len(perfectos) + len(bonus)
+    total_items = len(perfectos) + len(bonus)
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
-<body style="margin:0; padding:0; background:#efeae0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-<table width="100%" cellspacing="0" cellpadding="0" style="background:#efeae0; padding:20px 0;"><tr><td align="center">
-<table width="640" cellspacing="0" cellpadding="0" style="background:white; border-radius:6px; overflow:hidden;">
+<body style="margin:0; padding:0; background:#efeae0; font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+<table width="100%" cellspacing="0" cellpadding="0" style="background:#efeae0; padding:24px 0;"><tr><td align="center">
+<table width="640" cellspacing="0" cellpadding="0" style="background:white; border-radius:4px; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,0.04);">
 
-  <tr><td style="padding:28px 24px; background:#1a1a1a; color:white;">
-    <div style="font-size:12px; letter-spacing:2px; color:#c74b2e; font-weight:600;">CASA MUSA</div>
-    <h1 style="margin:6px 0 0; font-size:24px; font-weight:700;">Masia Alert</h1>
-    <p style="margin:8px 0 0; font-size:13px; color:#bbb;">{fecha} · {len(perfectos)} ⭐ perfectos · {len(bonus)} 🔥 cerca</p>
+  <tr><td style="padding:40px 32px 32px; background:#1a1a1a;">
+    <div style="color:#c74b2e; font-size:11px; letter-spacing:3px; font-weight:700; margin-bottom:8px;">CASA MUSA</div>
+    <h1 style="margin:0; font-size:28px; color:white; font-weight:300; letter-spacing:-0.5px;">Informe diario de propiedades</h1>
+    <div style="margin-top:16px; padding-top:16px; border-top:1px solid #333;">
+      <span style="color:#999; font-size:13px;">{fecha}</span>
+      <span style="color:#555; font-size:13px; margin:0 8px;">·</span>
+      <span style="color:#ccc; font-size:13px;">{len(perfectos)} principales</span>
+      <span style="color:#555; font-size:13px; margin:0 8px;">·</span>
+      <span style="color:#ccc; font-size:13px;">{len(bonus)} interesantes</span>
+    </div>
   </td></tr>
 
   {bloques}
 
-  <tr><td style="padding:20px 24px; background:#fafaf7; border-top:1px solid #e5e5e5;">
-    <div style="color:#666; font-size:12px; line-height:1.6;">
-      <strong style="color:#1a1a1a;">⭐ Criterios perfectos:</strong><br>
-      🏠 Masias: max 150.000 € · min 5 ha<br>
-      🌾 Terrenos: max 60.000 € · min 10 ha<br>
-      <br>
-      <strong style="color:#92400e;">🔥 Cerca (bonus):</strong><br>
-      🏠 Masias: max 200.000 € · min 2 ha<br>
-      🌾 Terrenos grandes (+20ha) hasta 150.000 €
+  <tr><td style="padding:24px 32px; background:#f8f5ef; border-top:1px solid #eeeae2;">
+    <div style="color:#666; font-size:12px; line-height:1.7;">
+      <div style="color:#1a1a1a; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:10px; margin-bottom:8px;">Criterios principales</div>
+      Masias — hasta 150.000 €, mínimo 5 ha<br>
+      Terrenos — hasta 60.000 €, mínimo 10 ha<br><br>
+      <div style="color:#d97706; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:10px; margin-bottom:8px;">Criterios cerca (interesantes)</div>
+      Masias — hasta 200.000 €, mínimo 2 ha<br>
+      Terrenos grandes — más de 20 ha, hasta 150.000 €
     </div>
   </td></tr>
 
-  <tr><td style="padding:16px 24px; background:#1a1a1a; color:#888; font-size:11px; text-align:center;">
-    CASA MUSA · Alerta diaria 08:00
+  <tr><td style="padding:20px 32px; background:#1a1a1a; color:#666; font-size:11px; text-align:center; letter-spacing:1px;">
+    CASA MUSA · Provincia de Tarragona · Alerta diaria
   </td></tr>
 
 </table></td></tr></table></body></html>"""
@@ -410,12 +378,12 @@ def enviar_email(perfectos, bonus, nuevos, total_scraped):
     nb = len(bonus)
     nn = len(nuevos)
     if nn > 0:
-        asunto = f"CASA MUSA · {nn} {'nueva' if nn == 1 else 'nuevas'} · {np}⭐ {nb}🔥"
+        asunto = f"Casa Musa · {nn} {'nueva' if nn == 1 else 'nuevas'} propiedades"
     else:
-        asunto = f"CASA MUSA · {np}⭐ perfectos · {nb}🔥 cerca · {datetime.now().strftime('%d.%m')}"
+        asunto = f"Casa Musa · Informe del {datetime.now().strftime('%d/%m')}"
 
     msg["Subject"] = asunto
-    msg["From"] = CONFIG["email_absender"]
+    msg["From"] = f"Casa Musa <{CONFIG['email_absender']}>"
     msg["To"] = ", ".join(dest)
     msg.attach(MIMEText(construir_email(perfectos, bonus, total_scraped), "html", "utf-8"))
 
@@ -425,10 +393,10 @@ def enviar_email(perfectos, bonus, nuevos, total_scraped):
             srv.starttls(context=ctx)
             srv.login(CONFIG["email_absender"], CONFIG["email_passwort"])
             srv.sendmail(CONFIG["email_absender"], dest, msg.as_string())
-        print(f"\n  ✉️  Email a {len(dest)}: {np}⭐ + {nb}🔥 ({nn} nuevas)")
+        print(f"\n  Email a {len(dest)}: {np} principales + {nb} cerca ({nn} nuevas)")
         return True
     except Exception as e:
-        print(f"  ❌ Error email: {e}")
+        print(f"  Error email: {e}")
         return False
 
 
@@ -453,19 +421,19 @@ def ejecutar():
         else:
             descartados.append((a, razon))
 
-    print(f"  ⭐ Perfectos: {len(perfectos)}")
-    print(f"  🔥 Bonus (cerca): {len(bonus)}")
-    print(f"  ❌ Descartados: {len(descartados)}")
+    print(f"  Perfectos: {len(perfectos)}")
+    print(f"  Bonus: {len(bonus)}")
+    print(f"  Descartados: {len(descartados)}")
 
     if perfectos:
-        print(f"\n  ⭐ Perfectos:")
+        print(f"\n  Perfectos:")
         for a in perfectos:
-            print(f"    · {(a.get('titulo') or '')[:50]:50} | {a.get('precio')}€ | {m2_a_ha(a.get('m2_parcela'))}ha")
+            print(f"    · {(a.get('titulo') or '')[:50]:50} | {a.get('precio')}€ | {m2_a_ha(a.get('m2_parcela'))}ha | {a.get('fuente','')}")
 
     if bonus:
-        print(f"\n  🔥 Bonus:")
+        print(f"\n  Bonus:")
         for a in bonus:
-            print(f"    · {(a.get('titulo') or '')[:50]:50} | {a.get('precio')}€ | {m2_a_ha(a.get('m2_parcela'))}ha")
+            print(f"    · {(a.get('titulo') or '')[:50]:50} | {a.get('precio')}€ | {m2_a_ha(a.get('m2_parcela'))}ha | {a.get('fuente','')}")
 
     todos_mostrados = perfectos + bonus
     nuevos = [a for a in todos_mostrados if a["id"] not in vistos]
