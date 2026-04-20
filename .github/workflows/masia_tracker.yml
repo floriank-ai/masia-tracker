@@ -2,10 +2,12 @@ name: CASA MUSA Masia Alert
 
 on:
   schedule:
-    # Täglich um 08:00 Uhr Madrid-Zeit (06:00 UTC im Winter, 07:00 UTC im Sommer)
-    # Wir nehmen 07:00 UTC = 08:00 Winter / 09:00 Sommer
+    # Täglich 08:00 Madrid-Zeit (06:00 UTC Winter, 07:00 UTC Sommer)
     - cron: '0 7 * * *'
-  workflow_dispatch:  # Manuell startbar
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Erlaubt dem Workflow zu pushen
 
 jobs:
   run-tracker:
@@ -22,14 +24,6 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pip install requests
 
-      - name: Gesehene Angebote laden (Cache)
-        uses: actions/cache@v4
-        with:
-          path: masia_gesehen.json
-          key: masia-gesehen-${{ github.run_id }}
-          restore-keys: |
-            masia-gesehen-
-
       - name: Ejecutar CASA MUSA Alert
         env:
           EMAIL_ABSENDER:    ${{ secrets.EMAIL_ABSENDER }}
@@ -37,3 +31,11 @@ jobs:
           EMAIL_EMPFAENGER:  ${{ secrets.EMAIL_EMPFAENGER }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python masia_tracker.py
+
+      - name: Commit gesehen-Datei
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add masia_gesehen.json || true
+          git diff --staged --quiet || git commit -m "Update masia_gesehen.json [skip ci]"
+          git push || echo "Nichts zu pushen"
