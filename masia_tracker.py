@@ -1,6 +1,7 @@
 """
 CASA MUSA - Masia Alert
-Scraping via Claude API. Sauberes professionelles Design.
+Scraping via Gemini API (KOSTENLOS: 500 Requests/Tag im Free Tier).
+Verwendet Gemini 2.5 Flash mit URL Context Tool.
 """
 
 import json
@@ -19,13 +20,14 @@ CONFIG = {
     "email_absender":   os.environ.get("EMAIL_ABSENDER",   ""),
     "email_passwort":   os.environ.get("EMAIL_PASSWORT",   ""),
     "email_empfaenger": os.environ.get("EMAIL_EMPFAENGER", ""),
-    "anthropic_key":    os.environ.get("ANTHROPIC_API_KEY", ""),
+    "gemini_key":       os.environ.get("GEMINI_API_KEY", ""),
     "smtp_server":      "smtp.gmail.com",
     "smtp_port":        587,
     "archivo_vistos":   "masia_gesehen.json",
 }
 
-DELAY_ENTRE_REQUESTS = 75
+# Rate limit: 10 RPM -> 7s Pause ist safe
+DELAY_ENTRE_REQUESTS = 8
 
 PORTALES = [
     {
@@ -50,64 +52,87 @@ PORTALES = [
 ]
 
 
-PROMPT_EXTRACCION = """Du bekommst eine spanische Immobilien-Webseite. Extrahiere ABSOLUT JEDE EINZELNE Immobilien-Anzeige.
+PROMPT_EXTRACCION = """Analysiere die URL die dir uebergeben wird. Es ist eine spanische Immobilien-Webseite. Extrahiere ABSOLUT JEDE EINZELNE Immobilien-Anzeige.
 
 KRITISCH: Extrahiere JEDE Anzeige, auch 30-100 Stueck. NICHT nur 2-3!
 
-Gib JSON zurueck: {"anuncios": [{"ref": "...", "titulo": "...", "pueblo": "...", "comarca": "...", "precio": 90000, "precio_original": null, "m2_construida": null, "m2_parcela": 55000, "url": "https://...", "estado": "disponible", "tipo": "masia"}]}
+Gib NUR ein JSON zurueck (kein Markdown, keine ```json Marker):
+{"anuncios": [{"ref": "...", "titulo": "...", "pueblo": "...", "comarca": "...", "precio": 90000, "precio_original": null, "m2_construida": null, "m2_parcela": 55000, "url": "https://...", "estado": "disponible", "tipo": "masia"}]}
 
 Felder:
-- ref: Referenznummer/ID
-- titulo: Titel
+- ref: Referenznummer/ID als String
+- titulo: Titel der Anzeige
 - pueblo: Ortschaft
-- comarca: Region
-- precio: Euro als Zahl (90000, nicht "90.000 €")
+- comarca: Region (Baix Ebre, Priorat, Alt/Baix Camp, Alt/Baix Penedès, Ribera d'Ebre, Terra Alta, Tarragonès, Montsià)
+- precio: Euro als Zahl (90000 - ohne Punkte/Kommas/Einheiten)
 - precio_original: bei Rabatt, sonst null
-- m2_construida: Haus-m² (null wenn unbekannt)
-- m2_parcela: Grundstueck-m² (parcela/terreno)
-- url: volle URL
-- estado: disponible|reservado|vendido|novedad|oportunidad|rebajado
+- m2_construida: Haus-m² als Zahl, null wenn unbekannt
+- m2_parcela: Grundstueck-m² als Zahl
+- url: volle URL zur Anzeige
+- estado: disponible | reservado | vendido | novedad | oportunidad | rebajado
 - tipo: masia (mit Haus) | terreno (nur Grundstueck)
 
-NUR JSON, kein Markdown.
+URL zum Analysieren: {url_target}
 """
 
 
-def scrape_via_claude(url, portal_name, retry=0):
-    if not CONFIG["anthropic_key"]:
+def scrape_via_gemini(url, portal_name, retry=0):
+    if not CONFIG["gemini_key"]:
+        print("  ⚠️  GEMINI_API_KEY no configurada")
         return []
 
-    headers = {
-        "x-api-key": CONFIG["anthropic_key"],
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "web-fetch-2025-09-10",
-        "content-type": "application/json",
-    }
+    # Gemini API Endpoint mit URL Context Tool
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={CONFIG['gemini_key']}"
+
+    prompt = PROMPT_EXTRACCION.replace("{url_target}", url)
+
     body = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 16000,
-        "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 1}],
-        "messages": [{"role": "user", "content": f"{PROMPT_EXTRACCION}\n\nRufe ab und extrahiere ALLE Anzeigen: {url}"}]
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "tools": [{"url_context": {}}],
+        "generationConfig": {
+            "maxOutputTokens": 16000,
+            "temperature": 0.1,
+        }
     }
 
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=240)
+        r = requests.post(api_url, json=body, timeout=180)
         if r.status_code == 429 and retry < 3:
-            print(f"      Rate limit, warte 70s... (retry {retry+1}/3)")
-            time.sleep(70)
-            return scrape_via_claude(url, portal_name, retry + 1)
+            print(f"      Rate limit, warte 30s... (retry {retry+1}/3)")
+            time.sleep(30)
+            return scrape_via_gemini(url, portal_name, retry + 1)
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
-        print(f"      API error: {str(e)[:150]}")
+        print(f"      API error: {str(e)[:200]}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"      Response: {e.response.text[:300]}")
         return []
 
-    text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-    full_text = re.sub(r'```(?:json)?\s*', '', "\n".join(text_parts))
+    # Text aus Antwort extrahieren
+    try:
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print(f"      Keine Antwort von Gemini: {json.dumps(data)[:300]}")
+            return []
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        text_parts = [p.get("text", "") for p in parts if "text" in p]
+        full_text = "\n".join(text_parts)
+    except (KeyError, IndexError) as e:
+        print(f"      Parse error: {e}")
+        return []
+
+    # Markdown-Marker entfernen
+    full_text = re.sub(r'```(?:json)?\s*', '', full_text)
     full_text = re.sub(r'```', '', full_text)
 
     json_match = re.search(r'\{[\s\S]*"anuncios"[\s\S]*\}', full_text)
     if not json_match:
+        print(f"      Kein JSON in Antwort")
+        print(f"      Ausgabe: {full_text[:300]}")
         return []
 
     try:
@@ -116,7 +141,8 @@ def scrape_via_claude(url, portal_name, retry=0):
         for a in anuncios:
             a["fuente"] = portal_name
         return anuncios
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"      JSON error: {e}")
         return []
 
 
@@ -127,11 +153,10 @@ def recopilar_todos():
         print(f"\n  {portal['nombre']}")
         for url in portal["urls"]:
             if not primer:
-                print(f"    Pausa {DELAY_ENTRE_REQUESTS}s...")
                 time.sleep(DELAY_ENTRE_REQUESTS)
             primer = False
             print(f"    -> {url[:80]}")
-            anuncios = scrape_via_claude(url, portal["nombre"])
+            anuncios = scrape_via_gemini(url, portal["nombre"])
             print(f"       {len(anuncios)} anuncios")
             for a in anuncios:
                 ref = str(a.get("ref", "")).strip() or a.get("url", "")[-30:]
@@ -297,7 +322,10 @@ def render_tarjeta(a, es_bonus=False):
 
 
 def construir_email(perfectos, bonus, total_scraped):
-    fecha = datetime.now().strftime("%d de %B de %Y").replace("January","enero").replace("February","febrero").replace("March","marzo").replace("April","abril").replace("May","mayo").replace("June","junio").replace("July","julio").replace("August","agosto").replace("September","septiembre").replace("October","octubre").replace("November","noviembre").replace("December","diciembre")
+    # Monate auf Spanisch
+    meses = ["", "enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    d = datetime.now()
+    fecha = f"{d.day} de {meses[d.month]} de {d.year}"
 
     p_masias   = sorted([a for a in perfectos if clasificar(a) == "masia"],   key=lambda a: a.get("precio") or 9e9)
     p_terrenos = sorted([a for a in perfectos if clasificar(a) == "terreno"], key=lambda a: a.get("precio") or 9e9)
@@ -326,8 +354,6 @@ def construir_email(perfectos, bonus, total_scraped):
 
     if not perfectos and not bonus:
         bloques = f'<tr><td style="padding:60px 24px; text-align:center; background:white;"><p style="margin:0 0 8px; font-size:15px; color:#1a1a1a;">Hoy no hay propiedades que cumplan los criterios.</p><p style="margin:0; font-size:13px; color:#999;">{total_scraped} propiedades analizadas.</p></td></tr>'
-
-    total_items = len(perfectos) + len(bonus)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
