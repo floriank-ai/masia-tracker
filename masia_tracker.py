@@ -103,6 +103,11 @@ def scrape_via_gemini(url, portal_name, retry=0):
             print(f"      Rate limit, warte 30s... (retry {retry+1}/3)")
             time.sleep(30)
             return scrape_via_gemini(url, portal_name, retry + 1)
+        if r.status_code == 503 and retry < 5:
+            wait = 30 + (retry * 15)  # 30s, 45s, 60s, 75s, 90s
+            print(f"      Gemini überlastet (503), warte {wait}s... (retry {retry+1}/5)")
+            time.sleep(wait)
+            return scrape_via_gemini(url, portal_name, retry + 1)
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
@@ -143,6 +148,34 @@ def scrape_via_gemini(url, portal_name, retry=0):
         return anuncios
     except json.JSONDecodeError as e:
         print(f"      JSON error: {e}")
+        # Fallback: Control Characters entfernen und nochmal versuchen
+        try:
+            cleaned = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', json_match.group(0))
+            parsed = json.loads(cleaned)
+            anuncios = parsed.get("anuncios", [])
+            for a in anuncios:
+                a["fuente"] = portal_name
+            print(f"      ✓ Gerettet: {len(anuncios)} Anzeigen nach Cleanup")
+            return anuncios
+        except json.JSONDecodeError:
+            pass
+        # Letzter Fallback: einzelne Objekte rausziehen
+        try:
+            objetos = re.findall(r'\{[^{}]*"ref"[^{}]*\}', json_match.group(0))
+            anuncios = []
+            for obj in objetos:
+                try:
+                    clean_obj = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', obj)
+                    a = json.loads(clean_obj)
+                    a["fuente"] = portal_name
+                    anuncios.append(a)
+                except:
+                    continue
+            if anuncios:
+                print(f"      ✓ Gerettet: {len(anuncios)} Anzeigen einzeln")
+                return anuncios
+        except:
+            pass
         return []
 
 
