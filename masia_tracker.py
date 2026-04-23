@@ -35,6 +35,8 @@ PORTALES = [
         "urls": [
             "https://www.buscomasia.com/venta/provincia-tarragona/precio-asc/",
             "https://www.buscomasia.com/priorat/",
+            "https://www.buscomasia.com/baix-ebre/",
+            "https://www.buscomasia.com/alt-penedes/",
         ],
     },
     {
@@ -49,31 +51,57 @@ PORTALES = [
             "https://www.fotocasa.es/es/inmobiliaria-finques-via-augusta/comprar/inmuebles/espana/todas-las-zonas/l?clientId=9202754898213",
         ],
     },
+    {
+        "nombre": "Idealista",
+        "urls": [
+            "https://www.idealista.com/venta-terrenos/tarragona-provincia/con-terrenos-no-urbanizables/?precio-hasta=150000",
+            "https://www.idealista.com/venta-viviendas/tarragona-provincia/con-casas-de-campo/?precio-hasta=200000",
+        ],
+    },
+    {
+        "nombre": "Habitaclia",
+        "urls": [
+            "https://www.habitaclia.com/comprar-finca_rustica-tarragona.htm",
+        ],
+    },
+    {
+        "nombre": "Kyero",
+        "urls": [
+            "https://www.kyero.com/es/venta/tarragona/fincas",
+        ],
+    },
 ]
 
 
-PROMPT_EXTRACCION = """Analysiere die URL die dir uebergeben wird. Es ist eine spanische Immobilien-Webseite. Extrahiere ABSOLUT JEDE EINZELNE Immobilien-Anzeige.
+PROMPT_EXTRACCION = """AUFGABE: Analysiere die URL und gib SOFORT valides JSON zurueck. KEINE Gedanken, KEINE Erklaerungen, KEIN Markdown, NUR JSON.
 
-KRITISCH: Extrahiere JEDE Anzeige, auch 30-100 Stueck. NICHT nur 2-3!
+Die URL ist eine spanische Immobilien-Webseite. Extrahiere JEDE Immobilien-Anzeige.
 
-Gib NUR ein JSON zurueck (kein Markdown, keine ```json Marker):
-{"anuncios": [{"ref": "...", "titulo": "...", "pueblo": "...", "comarca": "...", "precio": 90000, "precio_original": null, "m2_construida": null, "m2_parcela": 55000, "url": "https://...", "estado": "disponible", "tipo": "masia"}]}
+WICHTIG:
+- Extrahiere JEDE Anzeige, auch 30-100 Stueck
+- Deine Antwort beginnt DIREKT mit { und endet mit }
+- Keine Vorrede, keine Markdown-Blocks, keine Kommentare
+- Wenn die Seite nicht lädt: gib {"anuncios": []} zurueck
+
+Format:
+{"anuncios":[{"ref":"8610","titulo":"Masía...","pueblo":"Tortosa","comarca":"Baix Ebre","precio":90000,"precio_original":null,"m2_construida":null,"m2_parcela":55000,"url":"https://...","estado":"disponible","tipo":"masia"}]}
 
 Felder:
-- ref: Referenznummer/ID als String
-- titulo: Titel der Anzeige
-- pueblo: Ortschaft
-- comarca: Region (Baix Ebre, Priorat, Alt/Baix Camp, Alt/Baix Penedès, Ribera d'Ebre, Terra Alta, Tarragonès, Montsià)
-- precio: Euro als Zahl (90000 - ohne Punkte/Kommas/Einheiten)
+- ref: ID als String
+- titulo: Titel
+- pueblo: Ort
+- comarca: Region
+- precio: Euro als Integer (90000 statt "90.000 €")
 - precio_original: bei Rabatt, sonst null
-- m2_construida: Haus-m² als Zahl, null wenn unbekannt
-- m2_parcela: Grundstueck-m² als Zahl
-- url: volle URL zur Anzeige
+- m2_construida: Haus-m² als Number, sonst null
+- m2_parcela: Grundstueck-m² als Number
+- url: volle URL
 - estado: disponible | reservado | vendido | novedad | oportunidad | rebajado
-- tipo: masia (mit Haus) | terreno (nur Grundstueck)
+- tipo: "masia" (mit Haus) | "terreno" (ohne Haus)
 
-URL zum Analysieren: {url_target}
-"""
+URL: {url_target}
+
+ANTWORTE JETZT MIT REINEM JSON:"""
 
 
 def scrape_via_gemini(url, portal_name, retry=0):
@@ -94,6 +122,8 @@ def scrape_via_gemini(url, portal_name, retry=0):
         "generationConfig": {
             "maxOutputTokens": 16000,
             "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0}
         }
     }
 
