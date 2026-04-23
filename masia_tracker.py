@@ -35,8 +35,13 @@ PORTALES = [
         "urls": [
             "https://www.buscomasia.com/venta/provincia-tarragona/precio-asc/",
             "https://www.buscomasia.com/priorat/",
-            "https://www.buscomasia.com/baix-ebre/",
-            "https://www.buscomasia.com/alt-penedes/",
+        ],
+    },
+    {
+        "nombre": "Terrenos.es",
+        "urls": [
+            "https://tarragona.terrenos.es/",
+            "https://tarragona.terrenos.es/urbanizable",
         ],
     },
     {
@@ -52,22 +57,9 @@ PORTALES = [
         ],
     },
     {
-        "nombre": "Idealista",
-        "urls": [
-            "https://www.idealista.com/venta-terrenos/tarragona-provincia/con-terrenos-no-urbanizables/?precio-hasta=150000",
-            "https://www.idealista.com/venta-viviendas/tarragona-provincia/con-casas-de-campo/?precio-hasta=200000",
-        ],
-    },
-    {
         "nombre": "Habitaclia",
         "urls": [
             "https://www.habitaclia.com/comprar-finca_rustica-tarragona.htm",
-        ],
-    },
-    {
-        "nombre": "Kyero",
-        "urls": [
-            "https://www.kyero.com/es/venta/tarragona/fincas",
         ],
     },
 ]
@@ -122,7 +114,6 @@ def scrape_via_gemini(url, portal_name, retry=0):
         "generationConfig": {
             "maxOutputTokens": 16000,
             "temperature": 0.1,
-            "responseMimeType": "application/json",
             "thinkingConfig": {"thinkingBudget": 0}
         }
     }
@@ -287,8 +278,8 @@ def categorizar(a):
     if tipo == "terreno":
         if precio <= 60_000 and (ha is None or ha >= 5):
             return "perfecto", f"terreno {precio}€ {ha}ha"
-        if ha is not None and ha >= 20 and precio <= 150_000:
-            return "bonus", f"terreno grande {ha}ha"
+        if ha is not None and ha >= 5 and precio <= 150_000:
+            return "bonus", f"terreno {ha}ha {precio}€"
         if precio <= 90_000 and (ha is None or ha >= 3):
             return "bonus", f"terreno {precio}€ {ha}ha (cerca)"
         if precio > 150_000:
@@ -445,7 +436,7 @@ def construir_email(perfectos, bonus, total_scraped):
       Terrenos — hasta 60.000 €, mínimo 5 ha<br><br>
       <div style="color:#d97706; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:10px; margin-bottom:8px;">Criterios cerca (interesantes)</div>
       Masias — hasta 200.000 €, mínimo 1 ha<br>
-      Terrenos grandes — más de 20 ha, hasta 150.000 €
+      Terrenos — más de 5 ha, hasta 150.000 €
     </div>
   </td></tr>
 
