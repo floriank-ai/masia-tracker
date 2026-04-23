@@ -222,11 +222,11 @@ def categorizar(a):
         return "descartado", f"poca sup. {ha}ha"
 
     if tipo == "terreno":
-        if precio <= 60_000 and (ha is None or ha >= 10):
+        if precio <= 60_000 and (ha is None or ha >= 5):
             return "perfecto", f"terreno {precio}€ {ha}ha"
         if ha is not None and ha >= 20 and precio <= 150_000:
             return "bonus", f"terreno grande {ha}ha"
-        if precio <= 90_000 and (ha is None or ha >= 5):
+        if precio <= 90_000 and (ha is None or ha >= 3):
             return "bonus", f"terreno {precio}€ {ha}ha (cerca)"
         if precio > 150_000:
             return "descartado", f"caro {precio}€"
@@ -379,7 +379,7 @@ def construir_email(perfectos, bonus, total_scraped):
     <div style="color:#666; font-size:12px; line-height:1.7;">
       <div style="color:#1a1a1a; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:10px; margin-bottom:8px;">Criterios principales</div>
       Masias — hasta 150.000 €, mínimo 1 ha<br>
-      Terrenos — hasta 60.000 €, mínimo 10 ha<br><br>
+      Terrenos — hasta 60.000 €, mínimo 5 ha<br><br>
       <div style="color:#d97706; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:10px; margin-bottom:8px;">Criterios cerca (interesantes)</div>
       Masias — hasta 200.000 €, mínimo 1 ha<br>
       Terrenos grandes — más de 20 ha, hasta 150.000 €
